@@ -307,4 +307,15 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
     Timer().seq_lens = total_lengths
     rollout_data["total_lengths"] = [total_lengths[i] for i in partition]
 
+    # Discard sequences that exceed max_tokens_per_gpu to prevent OOM
+    if getattr(args, "max_tokens_per_gpu", None) and getattr(args, "use_dynamic_batch_size", False):
+        max_len = args.max_tokens_per_gpu
+        n_samples = len(rollout_data["total_lengths"])
+        keep = [i for i, l in enumerate(rollout_data["total_lengths"]) if l <= max_len]
+        if len(keep) < n_samples:
+            logger.info(f"Discarding {n_samples - len(keep)} sequences exceeding max_tokens_per_gpu={max_len}")
+            for key, val in rollout_data.items():
+                if isinstance(val, list) and len(val) == n_samples:
+                    rollout_data[key] = [val[i] for i in keep]
+
     return rollout_data

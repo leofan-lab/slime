@@ -24,7 +24,7 @@ TOOL_CONFIGS = {
     "max_tool_calls": 16,
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
     # Python interpreter settings
-    "python_timeout": 120,  # 2 minutes for complex calculations
+    "python_timeout": 10,  # 10s timeout; most useful code finishes in <1s
     "python_memory_limit": "4GB",  # 4GB per Python process
     "python_cpu_limit": 1,
     # Memory management settings

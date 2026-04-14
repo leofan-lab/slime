@@ -1,0 +1,14 @@
+FROM 801953956576.dkr.ecr.ap-south-1.amazonaws.com/faim-rl-slime:gemma4
+
+# Gemma4 model spec, provider, and weight converter
+COPY slime_plugins/models/gemma4_native.py /root/slime/slime_plugins/models/
+COPY slime_plugins/models/gemma4_provider.py /root/slime/slime_plugins/models/
+COPY slime_plugins/mbridge/gemma4.py /root/slime/slime_plugins/mbridge/
+COPY slime/backends/megatron_utils/megatron_to_hf/gemma4.py /root/slime/slime/backends/megatron_utils/megatron_to_hf/
+
+# Update __init__.py files to register Gemma4
+COPY slime_plugins/mbridge/__init__.py /root/slime/slime_plugins/mbridge/
+COPY slime/backends/megatron_utils/megatron_to_hf/__init__.py /root/slime/slime/backends/megatron_utils/megatron_to_hf/
+
+# Model args script
+COPY scripts/models/gemma4-31B.sh /root/slime/scripts/models/

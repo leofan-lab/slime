@@ -228,6 +228,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     response_token_ids = []
     loss_masks = []
     tool_call_count = 0  # Track actual tool call rounds
+    sample.rollout_log_probs = None  # Reset to avoid stale data from reused samples
+
+    import time as _time
+    _t_start = _time.monotonic()
+    _t_gen_total = 0.0
+    _t_tool_total = 0.0
+    _n_timeouts = 0
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
         # Check if total length exceeds max context length
@@ -269,7 +276,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         except ImportError:
             pass  # wandb not available
 
+        _t0 = _time.monotonic()
         output = await post(url, payload)
+        _t_gen_total += _time.monotonic() - _t0
 
         # Handle abort
         if output["meta_info"]["finish_reason"]["type"] == "abort":
@@ -297,7 +306,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if output["meta_info"]["finish_reason"]["type"] == "length":
             break
 
+        _t0 = _time.monotonic()
         next_obs, done = await execute_predictions(cur_response)
+        _t_tool_total += _time.monotonic() - _t0
+        if "timed out" in next_obs:
+            _n_timeouts += 1
         if done:
             break
 
@@ -317,6 +330,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if sample.rollout_log_probs is not None:
             sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
 
+            if len(response_token_ids) != len(sample.rollout_log_probs):
+                print(f"[DEBUG] turn={turn} n_response_tokens={len(response_token_ids)} "
+                      f"n_logprobs={len(sample.rollout_log_probs)} "
+                      f"n_cur_response_token_ids={len(cur_response_token_ids)} "
+                      f"n_cur_log_probs={len(cur_log_probs)} "
+                      f"n_obs_tokens={len(obs_tokens_ids)} "
+                      f"n_output_token_logprobs={len(output['meta_info'].get('output_token_logprobs', []))} "
+                      f"output_text_len={len(output.get('text', ''))} "
+                      f"has_logprobs={'output_token_logprobs' in output['meta_info']}")
+
             assert len(response_token_ids) == len(
                 sample.rollout_log_probs
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
@@ -325,6 +348,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
 
     # Set sample attributes
+    _t_total = _time.monotonic() - _t_start
+    if _t_total > 30 or tool_call_count >= 5:
+        print(f"[SAMPLE] idx={sample.index} total={_t_total:.1f}s gen={_t_gen_total:.1f}s tool={_t_tool_total:.1f}s "
+              f"turns={turn+1} tool_calls={tool_call_count} timeouts={_n_timeouts} "
+              f"resp_tokens={len(response_token_ids)} status={output['meta_info']['finish_reason']['type']}")
     sample.tokens = prompt_tokens_ids + response_token_ids
     sample.response_length = len(response_token_ids)
     sample.response = response

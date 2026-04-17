@@ -123,11 +123,17 @@ class Gemma4Experts(nn.Module):
             expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
             expert_mask = expert_mask.permute(2, 1, 0)  # [E, K, T]
         for expert_idx in expert_mask.sum(dim=(-1, -2)).nonzero(as_tuple=True)[0]:
+            # HF keeps a sentinel "no expert" index at num_experts for drop-token
+            # routing; guard for parity even though softmax-based routing can't
+            # emit it today.
+            if int(expert_idx) == self.num_experts:
+                continue
             top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
             x = hidden_states[token_idx]
             gate, up = F.linear(x, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
             out = F.linear(self.act_fn(gate) * up, self.down_proj[expert_idx])
-            final.index_add_(0, token_idx, out * top_k_weights[token_idx, top_k_pos, None])
+            out = out * top_k_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, out.to(final.dtype))
         return final
 
 
@@ -144,26 +150,33 @@ class Gemma4TransformerLayer(TransformerLayer):
     ):
         from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
         global_layer_number = layer_number + get_transformer_layer_offset(config)
+        # Megatron passes `layer_number` as 1-indexed (default 1), so in 0-indexed
+        # HF space a global layer is `(i+1) % pattern == 0` → `i % pattern == pattern-1`.
+        # Equivalently: `is_sliding` when `global_layer_number % pattern != 0`.
         self.is_sliding = bool(global_layer_number % config.sliding_window_pattern)
         self._is_global = not self.is_sliding
 
-        # For global layers, temporarily override config to use different head_dim/kv_heads
+        # Global layers have different head_dim and num_kv_heads. Swap those
+        # fields into `config` just long enough for super().__init__ to build
+        # the attention, then restore. Using try/finally keeps the shared
+        # config clean even if init raises. (Still not reentrant-safe under
+        # concurrent construction — Megatron layer init is single-threaded per
+        # rank today.)
         if self._is_global:
             orig_kv_channels = config.kv_channels
             orig_num_query_groups = config.num_query_groups
             config.kv_channels = config.global_kv_channels
             config.num_query_groups = config.global_num_query_groups
-
-        super().__init__(
-            config=config, submodules=submodules,
-            layer_number=layer_number, hidden_dropout=hidden_dropout,
-            **kwargs,
-        )
-
-        # Restore config after super().__init__ built the attention
-        if self._is_global:
-            config.kv_channels = orig_kv_channels
-            config.num_query_groups = orig_num_query_groups
+        try:
+            super().__init__(
+                config=config, submodules=submodules,
+                layer_number=layer_number, hidden_dropout=hidden_dropout,
+                **kwargs,
+            )
+        finally:
+            if self._is_global:
+                config.kv_channels = orig_kv_channels
+                config.num_query_groups = orig_num_query_groups
 
         # Tell the attention module whether this is a global layer
         self.self_attention._is_global = self._is_global
@@ -315,7 +328,20 @@ class Gemma4TransformerLayer(TransformerLayer):
 
 
 class SDPACoreAttention(nn.Module):
-    """Simple core attention using PyTorch SDPA. Supports head_dim > 256 and CP."""
+    """Gemma4 core attention.
+
+    Replaces TE's DotProductAttention because:
+    - Global layers have head_dim=512, which flash-attn 2.x doesn't support.
+    - Sliding-window layers need an explicit left-window mask (HF behavior).
+    - Context-parallelism on the global layers needs an all-gather+full-attn
+      path with a differentiable K/V gather.
+
+    Dispatch at call time (packed / thd shape):
+      - global  + CP>1   : `_forward_cp_global` (manual attention, per sub-seq)
+      - global  + CP==1  : sub-sequence causal SDPA (no O(T²) mask alloc)
+      - sliding + any    : flash_attn_varlen_func with (sw-1, 0) window
+    """
+
     def __init__(self, config, layer_number, attn_mask_type, attention_type="self",
                  attention_dropout=None, softmax_scale=None, **kwargs):
         super().__init__()
@@ -324,23 +350,13 @@ class SDPACoreAttention(nn.Module):
         self.dropout_p = config.attention_dropout if attention_dropout is None else attention_dropout
         self._is_sliding = False  # set by Gemma4TransformerLayer
 
-    @staticmethod
-    def _make_varlen_causal_mask(cu_seqlens, total_len, device, dtype):
-        """Build a [1, 1, T, T] causal mask from cu_seqlens for packed sequences."""
-        mask = torch.full((total_len, total_len), float("-inf"), device=device, dtype=dtype)
-        for i in range(len(cu_seqlens) - 1):
-            s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
-            seq_len = e - s
-            seq_mask = torch.where(
-                torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1),
-                float("-inf"), 0.0,
-            )
-            mask[s:e, s:e] = seq_mask
-        return mask.unsqueeze(0).unsqueeze(0)
+    def _resolve_scale(self, hn: int) -> float:
+        # `0.0 or fallback` would silently mask a misconfigured scale; be explicit.
+        return self.softmax_scale if self.softmax_scale is not None else (hn ** -0.5)
 
     @staticmethod
     def _adjust_cu_seqlens_for_cp(cu_seqlens, cp_rank, cp_size):
-        """Adjust cu_seqlens for a CP rank's local chunk."""
+        """Remap packed-sequence boundaries to a single CP rank's local chunk."""
         local_cu = [0]
         for i in range(len(cu_seqlens) - 1):
             seq_len = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
@@ -348,214 +364,192 @@ class SDPACoreAttention(nn.Module):
             local_cu.append(local_cu[-1] + chunk)
         return torch.tensor(local_cu, dtype=cu_seqlens.dtype, device=cu_seqlens.device)
 
-    def _expand_kv_for_gqa(self, q, k, v):
-        """Expand K/V heads to match Q heads for GQA (needed when SDPA can't broadcast)."""
-        nq, nk = q.shape[1], k.shape[1]
-        if nq != nk:
-            repeat = nq // nk
-            k = k.repeat_interleave(repeat, dim=1)
-            v = v.repeat_interleave(repeat, dim=1)
-        return k, v
-
-    def _forward_cp_global(self, query, key, value, attention_mask, packed_seq_params):
-        """Global attention with CP: all-gather KV, manual matmul attention."""
+    def _forward_cp_global(self, query, key, value, packed_seq_params):
+        """Global attention under CP: differentiable all-gather of K/V, then
+        per-sub-sequence causal SDPA using local Q against full-length K/V.
+        """
         from megatron.core import parallel_state
-        import torch.distributed as dist
-        import time as _time
+        from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 
         cp_group = parallel_state.get_context_parallel_group()
         cp_size = parallel_state.get_context_parallel_world_size()
         cp_rank = parallel_state.get_context_parallel_rank()
 
-        # One-shot timing on first call, rank 0
-        _do_time = (cp_rank == 0 and not getattr(SDPACoreAttention, '_cp_timed', False))
-        if _do_time:
-            torch.cuda.synchronize()
-            _t0 = _time.time()
-
         t_local = query.shape[0]
         np_q, hn = query.shape[1], query.shape[2]
         nk = key.shape[1]
-        scale = self.softmax_scale or (hn ** -0.5)
+        scale = self._resolve_scale(hn)
 
-        # All-gather K and V across CP ranks
-        k_full = torch.empty(t_local * cp_size, *key.shape[1:], dtype=key.dtype, device=key.device)
-        v_full = torch.empty(t_local * cp_size, *value.shape[1:], dtype=value.dtype, device=value.device)
-        dist.all_gather_into_tensor(k_full, key.contiguous(), group=cp_group)
-        dist.all_gather_into_tensor(v_full, value.contiguous(), group=cp_group)
+        # Differentiable all-gather along the token dim. forward: AG,
+        # backward: RS — so K/V grads on non-owning ranks flow back to the
+        # originating rank. The raw `dist.all_gather_into_tensor` has no
+        # autograd rule and PyTorch prints a "silently incorrect behavior"
+        # warning + drops those grads.
+        k_full = gather_from_sequence_parallel_region(key.contiguous(), group=cp_group)
+        v_full = gather_from_sequence_parallel_region(value.contiguous(), group=cp_group)
 
         cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
         out = torch.empty(t_local, np_q * hn, dtype=query.dtype, device=query.device)
 
-        if cu_seqlens is not None:
-            local_offset = 0
-            for s_idx in range(len(cu_seqlens) - 1):
-                seq_start = cu_seqlens[s_idx].item()
-                seq_len = (cu_seqlens[s_idx + 1] - cu_seqlens[s_idx]).item()
-                chunk_size = seq_len // cp_size
+        if cu_seqlens is None:
+            # Single-sequence fallback.
+            q4 = query.unsqueeze(0).transpose(1, 2)   # [1, np, t_local, hn]
+            k4 = k_full.unsqueeze(0).transpose(1, 2)  # [1, nk, t_full, hn]
+            v4 = v_full.unsqueeze(0).transpose(1, 2)
+            t_full = k_full.shape[0]
+            q_offset = cp_rank * t_local
+            row_idx = torch.arange(t_local, device=query.device) + q_offset
+            col_idx = torch.arange(t_full, device=query.device)
+            # SDPA attn_mask: additive; -inf where we must NOT attend.
+            mask = torch.where(
+                col_idx[None, :] > row_idx[:, None],
+                torch.finfo(query.dtype).min, 0.0,
+            ).to(dtype=query.dtype)
+            o = F.scaled_dot_product_attention(
+                q4, k4, v4, attn_mask=mask[None, None, :, :],
+                dropout_p=self.dropout_p if self.training else 0.0,
+                scale=scale, enable_gqa=(np_q != nk),
+            )
+            return o.transpose(1, 2).reshape(t_local, -1)
 
-                # Local Q [chunk, np, hn], full KV [seq_len, nk, hn]
-                q_seq = query[local_offset:local_offset + chunk_size]
-                k_seq = k_full[seq_start:seq_start + seq_len]
-                v_seq = v_full[seq_start:seq_start + seq_len]
+        # Packed sub-sequences: loop; each sub-seq emits a [chunk, T] causal
+        # block directly to `out`. Per-sub-seq masks stay small even for
+        # max_tokens_per_gpu = many thousands.
+        local_offset = 0
+        for s_idx in range(len(cu_seqlens) - 1):
+            seq_start = cu_seqlens[s_idx].item()
+            seq_len = (cu_seqlens[s_idx + 1] - cu_seqlens[s_idx]).item()
+            chunk = seq_len // cp_size
 
-                # [b, h, s, d] format for matmul
-                q4 = q_seq.unsqueeze(0).permute(0, 2, 1, 3)  # [1, np, chunk, hn]
-                k4 = k_seq.unsqueeze(0).permute(0, 2, 1, 3)  # [1, nk, seq_len, hn]
-                v4 = v_seq.unsqueeze(0).permute(0, 2, 1, 3)
+            q_seq = query[local_offset:local_offset + chunk]
+            k_seq = k_full[seq_start:seq_start + seq_len]
+            v_seq = v_full[seq_start:seq_start + seq_len]
 
-                # Expand KV for GQA
-                if np_q != nk:
-                    repeat = np_q // nk
-                    k4 = k4.repeat_interleave(repeat, dim=1)
-                    v4 = v4.repeat_interleave(repeat, dim=1)
+            q4 = q_seq.unsqueeze(0).transpose(1, 2)   # [1, np, chunk, hn]
+            k4 = k_seq.unsqueeze(0).transpose(1, 2)   # [1, nk, seq_len, hn]
+            v4 = v_seq.unsqueeze(0).transpose(1, 2)
 
-                # Q @ K^T * scale -> [1, np, chunk, seq_len]
-                attn_w = torch.matmul(q4, k4.transpose(-2, -1)) * scale
+            q_global_start = cp_rank * chunk
+            row_idx = torch.arange(chunk, device=query.device) + q_global_start
+            col_idx = torch.arange(seq_len, device=query.device)
+            mask = torch.where(
+                col_idx[None, :] > row_idx[:, None],
+                torch.finfo(query.dtype).min, 0.0,
+            ).to(dtype=query.dtype)
 
-                # Causal bias
-                q_global_start = cp_rank * chunk_size
-                row_idx = torch.arange(chunk_size, device=query.device) + q_global_start
-                col_idx = torch.arange(seq_len, device=query.device)
-                causal_mask = col_idx.unsqueeze(0) > row_idx.unsqueeze(1)  # [chunk, seq_len]
-                attn_w.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+            o = F.scaled_dot_product_attention(
+                q4, k4, v4, attn_mask=mask[None, None, :, :],
+                dropout_p=self.dropout_p if self.training else 0.0,
+                scale=scale, enable_gqa=(np_q != nk),
+            )
+            out[local_offset:local_offset + chunk] = o.transpose(1, 2).reshape(chunk, -1)
+            local_offset += chunk
 
-                # Softmax + @ V
-                attn_w = F.softmax(attn_w, dim=-1, dtype=attn_w.dtype)
-                o4 = torch.matmul(attn_w, v4)  # [1, np, chunk, hn]
+        return out
 
-                out[local_offset:local_offset + chunk_size] = o4.permute(0, 2, 1, 3).reshape(chunk_size, -1)
-                local_offset += chunk_size
-        else:
-            q4 = query.unsqueeze(0).permute(0, 2, 1, 3)
-            k4 = k_full.unsqueeze(0).permute(0, 2, 1, 3)
-            v4 = v_full.unsqueeze(0).permute(0, 2, 1, 3)
-            if np_q != nk:
-                repeat = np_q // nk
-                k4 = k4.repeat_interleave(repeat, dim=1)
-                v4 = v4.repeat_interleave(repeat, dim=1)
-            attn_w = torch.matmul(q4, k4.transpose(-2, -1)) * scale
-            offset = cp_rank * t_local
-            row_idx = torch.arange(t_local, device=query.device) + offset
-            col_idx = torch.arange(t_local * cp_size, device=query.device)
-            causal_mask = col_idx.unsqueeze(0) > row_idx.unsqueeze(1)
-            attn_w.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-            attn_w = F.softmax(attn_w, dim=-1, dtype=attn_w.dtype)
-            o4 = torch.matmul(attn_w, v4)
-            out = o4.permute(0, 2, 1, 3).reshape(t_local, -1)
+    def _forward_thd_flash(self, query, key, value, cu_seqlens):
+        """Sliding-window or head_dim<=256 path via flash_attn_varlen_func.
 
-        if _do_time:
-            torch.cuda.synchronize()
-            _elapsed = _time.time() - _t0
-            cu = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
-            _nseq = len(cu) - 1 if cu is not None else 1
-            print(f"[CP_GLOBAL] t_local={t_local} np={np_q} hn={hn} nseq={_nseq} "
-                  f"time={_elapsed:.3f}s", flush=True)
-            # Run a profiled replay of one sequence to get kernel breakdown
-            try:
-                import os
-                _prof_dir = os.environ.get("SAVE_DIR", "/tmp") + "/cp_profile"
-                os.makedirs(_prof_dir, exist_ok=True)
-                if cu is not None and len(cu) > 1:
-                    ss, sl = cu[0].item(), (cu[1] - cu[0]).item()
-                    ch = sl // cp_size
-                    _qp = query[:ch].unsqueeze(0).permute(0, 2, 1, 3)
-                    _kp = k_full[ss:ss+sl].unsqueeze(0).permute(0, 2, 1, 3)
-                    _vp = v_full[ss:ss+sl].unsqueeze(0).permute(0, 2, 1, 3)
-                    if np_q != nk:
-                        _kp = _kp.repeat_interleave(np_q // nk, dim=1)
-                        _vp = _vp.repeat_interleave(np_q // nk, dim=1)
-                    with torch.profiler.profile(
-                        activities=[torch.profiler.ProfilerActivity.CPU,
-                                    torch.profiler.ProfilerActivity.CUDA],
-                        record_shapes=True, with_flops=True,
-                    ) as _prof:
-                        _aw = torch.matmul(_qp, _kp.transpose(-2, -1)) * scale
-                        _ri = torch.arange(ch, device=query.device) + cp_rank * ch
-                        _ci = torch.arange(sl, device=query.device)
-                        _aw.masked_fill_((_ci.unsqueeze(0) > _ri.unsqueeze(1)).unsqueeze(0).unsqueeze(0), float("-inf"))
-                        _aw = F.softmax(_aw, dim=-1, dtype=_aw.dtype)
-                        _ = torch.matmul(_aw, _vp)
-                        torch.cuda.synchronize()
-                    print(_prof.key_averages().table(sort_by="cuda_time_total", row_limit=15), flush=True)
-                    _prof.export_chrome_trace(f"{_prof_dir}/cp_global_trace.json")
-                    print(f"[CP_GLOBAL] trace saved to {_prof_dir}/cp_global_trace.json", flush=True)
-            except Exception as e:
-                print(f"[CP_GLOBAL] profiler error: {e}", flush=True)
-            SDPACoreAttention._cp_timed = True
+        Sliding-window layers must pass `window_size=(sliding_window-1, 0)` so
+        only tokens within `sliding_window` positions back are attended to —
+        this matches HF's `sliding_window_mask_function`. Global layers and
+        dense-attention sliding layers use the default full-causal window.
+        """
+        from flash_attn import flash_attn_varlen_func
 
+        window_size = (-1, -1)  # full causal when causal=True
+        if self._is_sliding:
+            sw = getattr(self.config, "sliding_window", None)
+            if sw and sw > 0:
+                window_size = (int(sw) - 1, 0)
+
+        cu = cu_seqlens.to(torch.int32)
+        max_seqlen = (cu[1:] - cu[:-1]).max().item()
+        out = flash_attn_varlen_func(
+            query.contiguous(), key.contiguous(), value.contiguous(),
+            cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            softmax_scale=self._resolve_scale(query.shape[2]),
+            causal=True,
+            window_size=window_size,
+        )
+        return out.reshape(query.shape[0], -1)
+
+    def _forward_thd_sdpa_per_subseq(self, query, key, value, cu_seqlens):
+        """Per-sub-sequence causal SDPA — used when flash-attn can't handle
+        head_dim (global layer w/o CP). Avoids materializing a [T, T] mask.
+        """
+        np_q, hn = query.shape[1], query.shape[2]
+        nk = key.shape[1]
+        scale = self._resolve_scale(hn)
+        out = torch.empty(query.shape[0], np_q * hn, dtype=query.dtype, device=query.device)
+        for i in range(len(cu_seqlens) - 1):
+            s = cu_seqlens[i].item()
+            e = cu_seqlens[i + 1].item()
+            q4 = query[s:e].unsqueeze(0).transpose(1, 2)  # [1, np, L, hn]
+            k4 = key[s:e].unsqueeze(0).transpose(1, 2)
+            v4 = value[s:e].unsqueeze(0).transpose(1, 2)
+            o = F.scaled_dot_product_attention(
+                q4, k4, v4,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                scale=scale, is_causal=True, enable_gqa=(np_q != nk),
+            )
+            out[s:e] = o.transpose(1, 2).reshape(e - s, -1)
         return out
 
     def forward(self, query, key, value, attention_mask=None, attn_mask_type=None,
                 packed_seq_params=None, **kwargs):
-        cp_size = self.config.context_parallel_size if hasattr(self.config, 'context_parallel_size') else 1
-
+        cp_size = getattr(self.config, "context_parallel_size", 1) or 1
         is_thd = query.dim() == 3
-        if is_thd:
-            # For global layers with CP > 1, use manual matmul attention
-            if cp_size > 1 and not self._is_sliding:
-                return self._forward_cp_global(query, key, value, attention_mask, packed_seq_params)
 
-            # Determine cu_seqlens (adjust for CP on sliding window layers)
+        if is_thd:
+            # Global layer + CP > 1: all-gather KV, manual attention.
+            if cp_size > 1 and not self._is_sliding:
+                return self._forward_cp_global(query, key, value, packed_seq_params)
+
+            # Remap cu_seqlens to the local CP chunk (sliding path only; global
+            # path above handles its own CP geometry).
+            cu_seqlens = None
             if packed_seq_params is not None:
                 cu_seqlens = packed_seq_params.cu_seqlens_q
                 if cp_size > 1:
                     from megatron.core import parallel_state
                     cp_rank = parallel_state.get_context_parallel_rank()
                     cu_seqlens = self._adjust_cu_seqlens_for_cp(cu_seqlens, cp_rank, cp_size)
-            else:
-                cu_seqlens = None
 
-            # Use flash_attn_varlen_func for head_dim <= 256 with packed sequences
             hn = query.shape[2]
-            if cu_seqlens is not None and hn <= 256:
-                from flash_attn import flash_attn_varlen_func
-                # flash_attn expects [t, np, hn] — already in that format
-                # Expand KV for GQA not needed — flash_attn handles GQA natively
-                max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
-                out = flash_attn_varlen_func(
-                    query.contiguous(), key.contiguous(), value.contiguous(),
-                    cu_seqlens_q=cu_seqlens.to(torch.int32),
-                    cu_seqlens_k=cu_seqlens.to(torch.int32),
-                    max_seqlen_q=max_seqlen,
-                    max_seqlen_k=max_seqlen,
-                    dropout_p=self.dropout_p if self.training else 0.0,
-                    softmax_scale=self.softmax_scale,
-                    causal=True,
-                )
-                # flash_attn returns [t, np, hn] -> [t, np*hn]
-                return out.reshape(query.shape[0], -1)
-
-            # Fallback: SDPA with explicit mask (head_dim > 256 or no packed_seq_params)
-            q = query.unsqueeze(0).permute(0, 2, 1, 3)
-            k = key.unsqueeze(0).permute(0, 2, 1, 3)
-            v = value.unsqueeze(0).permute(0, 2, 1, 3)
-            k, v = self._expand_kv_for_gqa(q, k, v)
-
             if cu_seqlens is not None:
-                attn_mask = self._make_varlen_causal_mask(
-                    cu_seqlens, query.shape[0], query.device, query.dtype
-                )
-            else:
-                attn_mask = None
+                if hn <= 256:
+                    return self._forward_thd_flash(query, key, value, cu_seqlens)
+                # Global layer, no CP, packed — flash-attn won't take head_dim>256.
+                return self._forward_thd_sdpa_per_subseq(query, key, value, cu_seqlens)
 
+            # Un-packed thd (rare, e.g. eval with batch=1 seq only): plain SDPA.
+            q = query.unsqueeze(0).transpose(1, 2)
+            k = key.unsqueeze(0).transpose(1, 2)
+            v = value.unsqueeze(0).transpose(1, 2)
+            nq, nk = q.shape[1], k.shape[1]
             out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=attn_mask, dropout_p=self.dropout_p if self.training else 0.0,
-                scale=self.softmax_scale, is_causal=(attn_mask is None),
+                q, k, v,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                scale=self._resolve_scale(hn), is_causal=True,
+                enable_gqa=(nq != nk),
             )
-            return out.permute(0, 2, 1, 3).reshape(query.shape[0], -1)
-        else:
-            # Standard path: [sq, b, np, hn] -> [b, np, sq, hn]
-            q = query.permute(1, 2, 0, 3)
-            k = key.permute(1, 2, 0, 3)
-            v = value.permute(1, 2, 0, 3)
-            k, v = self._expand_kv_for_gqa(q, k, v)
-            out = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout_p if self.training else 0.0,
-                scale=self.softmax_scale, is_causal=True,
-            )
-            # [b, np, sq, hn] -> [sq, b, np*hn]
-            return out.permute(2, 0, 1, 3).reshape(out.size(2), out.size(0), -1)
+            return out.transpose(1, 2).reshape(query.shape[0], -1)
+
+        # bshd path (unused in training but kept for inference/eval parity).
+        q = query.permute(1, 2, 0, 3)
+        k = key.permute(1, 2, 0, 3)
+        v = value.permute(1, 2, 0, 3)
+        nq, nk = q.shape[1], k.shape[1]
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            scale=self._resolve_scale(query.shape[3]), is_causal=True,
+            enable_gqa=(nq != nk),
+        )
+        return out.permute(2, 0, 1, 3).reshape(out.size(2), out.size(0), -1)
 
 
 class Gemma4SelfAttention(SelfAttention):
@@ -648,49 +642,111 @@ def get_gemma4_layer_spec_te() -> ModuleSpec:
     )
 
 
+def _load_hf_text_config(hf_checkpoint):
+    """Load HF config and unwrap `text_config` if it's a multimodal wrapper.
+
+    Cached via lru_cache so repeated callers (model provider, mbridge, weight
+    converter) all share the same parsed object.
+    """
+    from transformers import AutoConfig
+    cfg = AutoConfig.from_pretrained(hf_checkpoint, trust_remote_code=True)
+    return cfg.text_config if hasattr(cfg, "text_config") else cfg
+
+
 def get_gemma4_spec(args, config, vp_stage):
     """Return the native Gemma4 layer spec with proper config overrides."""
-    # Gemma uses GeGLU, not SwiGLU
+    hf_text = _load_hf_text_config(args.hf_checkpoint)
+
+    # Gemma4 features that this plugin does NOT implement — fail loudly rather
+    # than silently training a degraded model.
+    if getattr(hf_text, "hidden_size_per_layer_input", 0):
+        raise NotImplementedError(
+            "Gemma4 per-layer input mechanism "
+            f"(hidden_size_per_layer_input={hf_text.hidden_size_per_layer_input}) "
+            "is not implemented. See Gemma4TextDecoderLayer.per_layer_input_gate in HF."
+        )
+    if getattr(hf_text, "num_kv_shared_layers", 0):
+        raise NotImplementedError(
+            "Gemma4 KV-sharing across the last N layers "
+            f"(num_kv_shared_layers={hf_text.num_kv_shared_layers}) is not implemented."
+        )
+    if getattr(hf_text, "use_double_wide_mlp", False):
+        raise NotImplementedError("Gemma4 use_double_wide_mlp is not implemented.")
+    # Text-only training assumes causal attention for all layers. HF attention
+    # turns off causality when use_bidirectional_attention == "all".
+    if getattr(hf_text, "use_bidirectional_attention", "vision") == "all":
+        raise NotImplementedError(
+            "Gemma4 use_bidirectional_attention='all' disables causal masking; not supported."
+        )
+
+    # Gemma uses GeGLU (gated gelu-tanh), not SwiGLU. The shell scripts omit
+    # --swiglu and we set the gated-linear-unit flag + activation explicitly
+    # here so no downstream code is misled by stale Megatron defaults.
+    config.gated_linear_unit = True
     config.activation_func = _gelu_tanh
     config.bias_activation_fusion = False
 
-    # MoE: disable Megatron's built-in MoE (we use custom Gemma4 MoE in the layer)
+    # MoE: disable Megatron's built-in MoE (we use a custom Gemma4 MoE block in
+    # the layer body).
     config.moe_layer_freq = [0] * config.num_layers
 
-    # Heterogeneous layers need special checkpoint handling
+    # Heterogeneous layers (different head_dim / num_kv_heads on global vs
+    # sliding layers) need special checkpoint handling.
     config.hetereogenous_dist_checkpoint = True
 
-    # Read Gemma4-specific config from HF
-    from transformers import AutoConfig
-    hf_config = AutoConfig.from_pretrained(args.hf_checkpoint)
-    hf_text = hf_config.text_config if hasattr(hf_config, "text_config") else hf_config
-
-    # Set Gemma4TransformerConfig fields
+    # Promote the config to Gemma4TransformerConfig in place so the dataclass
+    # fields below are reachable by the rest of Megatron.
     config.__class__ = Gemma4TransformerConfig
-    config.global_kv_channels = getattr(hf_text, "global_head_dim", 512)
-    config.global_num_query_groups = getattr(hf_text, "num_global_key_value_heads", 4)
+    config.global_kv_channels = hf_text.global_head_dim
+    config.global_num_query_groups = hf_text.num_global_key_value_heads
     config.attention_k_eq_v = getattr(hf_text, "attention_k_eq_v", True)
     config.final_logit_softcapping = getattr(hf_text, "final_logit_softcapping", 30.0)
-    config.sliding_window = getattr(hf_text, "sliding_window", 1024)
-    config.sliding_window_pattern = getattr(hf_text, "sliding_window_pattern", 6)
-    config.query_pre_attn_scalar = getattr(hf_text, "query_pre_attn_scalar", 256)
+    config.sliding_window = hf_text.sliding_window
+    # `sliding_window_pattern` is not present in Gemma4 HF configs — infer from
+    # layer_types (find the first full_attention layer, its 1-indexed position
+    # is the pattern). Fall back to 6 for safety.
+    layer_types = list(getattr(hf_text, "layer_types", []))
+    try:
+        first_full = layer_types.index("full_attention")
+        config.sliding_window_pattern = first_full + 1
+    except ValueError:
+        config.sliding_window_pattern = 6
     config.softmax_scale = 1.0  # Gemma4 uses scaling=1.0, Q/K norms handle scaling
-    config.apply_rope_fusion = False  # Unfused RoPE needed for correct partial-rotary on global layers
+    # Unfused RoPE is required because we zero out `inv_freq` tail entries to
+    # implement partial-rotary on global layers — fused kernels ignore the
+    # zeroed freqs and rotate the full head_dim unconditionally.
+    config.apply_rope_fusion = False
 
-    # MoE config (26B-A4B)
-    config.enable_moe_block = getattr(hf_text, 'enable_moe_block', False)
+    # MoE block (26B-A4B)
+    config.enable_moe_block = getattr(hf_text, "enable_moe_block", False)
+    if config.enable_moe_block:
+        # These are consumed by Gemma4Router / Gemma4Experts; keep them aligned
+        # with HF's naming (num_experts, top_k_experts, moe_intermediate_size).
+        config.num_moe_experts = hf_text.num_experts
+        config.moe_router_topk = hf_text.top_k_experts
+        config.moe_ffn_hidden_size = hf_text.moe_intermediate_size
 
     # RoPE config
-    rope_params = getattr(hf_text, "rope_parameters", {})
-    config.rope_local_base_freq = (
-        rope_params.get("sliding_attention", {}).get("rope_theta", 10000.0)
-    )
-    config.global_partial_rotary_factor = (
-        rope_params.get("full_attention", {}).get("partial_rotary_factor", 0.25)
+    rope_params = getattr(hf_text, "rope_parameters", {}) or {}
+    config.rope_local_base_freq = rope_params.get("sliding_attention", {}).get("rope_theta", 10000.0)
+    config.global_partial_rotary_factor = rope_params.get("full_attention", {}).get(
+        "partial_rotary_factor", 0.25
     )
 
-    # Embedding scaling: Gemma4 multiplies embeddings by sqrt(hidden_size)
-    config.embedding_scaling_factor = hf_text.hidden_size ** 0.5
+    # CP sliding-window layer correctness: each CP rank processes a local chunk
+    # of each sequence and attends only within that chunk. This is only valid
+    # if the chunk is at least `sliding_window` tokens; otherwise tokens within
+    # the window that live on other ranks are silently dropped from attention.
+    cp_size = getattr(args, "context_parallel_size", 1) or 1
+    if cp_size > 1:
+        max_tokens = getattr(args, "max_tokens_per_gpu", None)
+        if max_tokens is not None and max_tokens < config.sliding_window:
+            raise ValueError(
+                f"context_parallel_size={cp_size} with max_tokens_per_gpu={max_tokens} "
+                f"< sliding_window={config.sliding_window}: sliding-window layers would "
+                "silently miss in-window tokens from other CP ranks. Reduce CP or raise "
+                "max_tokens_per_gpu."
+            )
 
     spec = get_gemma4_layer_spec_te()
 

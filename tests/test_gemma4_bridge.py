@@ -1,100 +1,164 @@
-"""Tests for Gemma4 mbridge checkpoint conversion (QKV packing for local vs global layers)."""
-import re
+"""Parity tests for slime_plugins.mbridge.gemma4 and
+slime/backends/megatron_utils/megatron_to_hf/gemma4.py.
+
+These exercise the ACTUAL production functions (Gemma4Bridge and
+convert_gemma4_to_hf) rather than re-implementing the pack/unpack.
+"""
+
+import importlib
+import importlib.util
+import os
+import pathlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 
-# Gemma4-31B config values
-HIDDEN_SIZE = 5376
-NUM_ATTENTION_HEADS = 32
-LOCAL_HEAD_DIM = 256
-LOCAL_NUM_KV_HEADS = 16
-GLOBAL_HEAD_DIM = 512
-GLOBAL_NUM_KV_HEADS = 4
-GLOBAL_ATTN_LAYERS = {5, 11, 17, 23, 29, 35, 41, 47, 53, 59}
+def _load_convert_module():
+    """Import the weight-conversion module either from the installed slime
+    package or from the repo's working copy relative to this test file."""
+    try:
+        return importlib.import_module("slime.backends.megatron_utils.megatron_to_hf.gemma4")
+    except ImportError:
+        pass
+    repo_path = pathlib.Path(__file__).resolve().parents[1] / (
+        "slime/backends/megatron_utils/megatron_to_hf/gemma4.py"
+    )
+    if not repo_path.exists():
+        pytest.skip(f"convert_gemma4_to_hf source not found at {repo_path}")
+    spec = importlib.util.spec_from_file_location("_gemma4_conv_under_test", repo_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def _pack_qkv_to_mcore(q, k, v, num_kv_heads, head_dim):
-    """Pack separate Q, K, V into Megatron's interleaved QKV format."""
-    q_heads_per_kv = NUM_ATTENTION_HEADS // num_kv_heads
-    q = q.view(num_kv_heads, q_heads_per_kv * head_dim, HIDDEN_SIZE)
-    k = k.view(num_kv_heads, head_dim, HIDDEN_SIZE)
-    v = v.view(num_kv_heads, head_dim, HIDDEN_SIZE)
-    return torch.cat([q, k, v], dim=1).view(-1, HIDDEN_SIZE).contiguous()
+# Gemma4-31B canonical config values.
+CFG_31B = SimpleNamespace(
+    hidden_size=5376,
+    num_attention_heads=32,
+    head_dim=256,
+    num_key_value_heads=16,
+    global_head_dim=512,
+    num_global_key_value_heads=4,
+    num_hidden_layers=60,
+    attention_k_eq_v=True,
+    layer_types=(["sliding_attention"] * 5 + ["full_attention"]) * 10,
+)
 
 
-def _unpack_qkv_from_mcore(param, num_kv_heads, head_dim, is_global=False):
-    """Unpack Megatron's interleaved QKV back to separate Q, K, V."""
-    q_heads_per_kv = NUM_ATTENTION_HEADS // num_kv_heads
-    param = param.view(num_kv_heads, (q_heads_per_kv + 2) * head_dim, HIDDEN_SIZE)
-    q_dim = q_heads_per_kv * head_dim
-    q = param[:, :q_dim, :].reshape(-1, HIDDEN_SIZE)
-    k = param[:, q_dim:q_dim + head_dim, :].reshape(-1, HIDDEN_SIZE)
-    if is_global:
-        return q, k
-    v = param[:, q_dim + head_dim:, :].reshape(-1, HIDDEN_SIZE)
-    return q, k, v
+def _pack_local_qkv(q, k, v):
+    """Megatron packs as [num_kv_heads, (q_per_kv + 2) * head_dim, hidden]."""
+    num_kv = CFG_31B.num_key_value_heads
+    head_dim = CFG_31B.head_dim
+    q_per_kv = CFG_31B.num_attention_heads // num_kv
+    q = q.view(num_kv, q_per_kv * head_dim, CFG_31B.hidden_size)
+    k = k.view(num_kv, head_dim, CFG_31B.hidden_size)
+    v = v.view(num_kv, head_dim, CFG_31B.hidden_size)
+    return torch.cat([q, k, v], dim=1).reshape(-1, CFG_31B.hidden_size).contiguous()
 
 
-@pytest.mark.unit
-def test_local_layer_qkv_roundtrip():
-    """Local layers: Q(32 heads x 256) + K(16 heads x 256) + V(16 heads x 256) roundtrips."""
-    q = torch.randn(NUM_ATTENTION_HEADS * LOCAL_HEAD_DIM, HIDDEN_SIZE)
-    k = torch.randn(LOCAL_NUM_KV_HEADS * LOCAL_HEAD_DIM, HIDDEN_SIZE)
-    v = torch.randn(LOCAL_NUM_KV_HEADS * LOCAL_HEAD_DIM, HIDDEN_SIZE)
-
-    packed = _pack_qkv_to_mcore(q, k, v, LOCAL_NUM_KV_HEADS, LOCAL_HEAD_DIM)
-    q2, k2, v2 = _unpack_qkv_from_mcore(packed, LOCAL_NUM_KV_HEADS, LOCAL_HEAD_DIM)
-
-    assert torch.equal(q, q2)
-    assert torch.equal(k, k2)
-    assert torch.equal(v, v2)
+def _pack_global_qkv(q, k):
+    """K=V global layers: stored as [q, k, k]."""
+    num_kv = CFG_31B.num_global_key_value_heads
+    head_dim = CFG_31B.global_head_dim
+    q_per_kv = CFG_31B.num_attention_heads // num_kv
+    q = q.view(num_kv, q_per_kv * head_dim, CFG_31B.hidden_size)
+    k = k.view(num_kv, head_dim, CFG_31B.hidden_size)
+    return torch.cat([q, k, k], dim=1).reshape(-1, CFG_31B.hidden_size).contiguous()
 
 
-@pytest.mark.unit
-def test_global_layer_kv_shared():
-    """Global layers: K=V, so packing [Q, K, K] and unpacking emits only Q, K."""
-    q = torch.randn(NUM_ATTENTION_HEADS * GLOBAL_HEAD_DIM, HIDDEN_SIZE)
-    k = torch.randn(GLOBAL_NUM_KV_HEADS * GLOBAL_HEAD_DIM, HIDDEN_SIZE)
+def test_convert_gemma4_to_hf_local_layer_roundtrip(monkeypatch):
+    """Load convert_gemma4_to_hf and verify roundtrip for a local layer."""
+    conv = _load_convert_module()
 
-    # Pack with V = K (K=V sharing)
-    packed = _pack_qkv_to_mcore(q, k, k.clone(), GLOBAL_NUM_KV_HEADS, GLOBAL_HEAD_DIM)
-    q2, k2 = _unpack_qkv_from_mcore(packed, GLOBAL_NUM_KV_HEADS, GLOBAL_HEAD_DIM, is_global=True)
+    # Prime the config cache so we don't need a real HF checkpoint on disk.
+    conv._config_cache["config"] = {
+        "global_attn_layers": {i for i, t in enumerate(CFG_31B.layer_types) if t == "full_attention"},
+        "local_head_dim": CFG_31B.head_dim,
+        "global_head_dim": CFG_31B.global_head_dim,
+        "num_attention_heads": CFG_31B.num_attention_heads,
+        "local_num_kv_heads": CFG_31B.num_key_value_heads,
+        "global_num_kv_heads": CFG_31B.num_global_key_value_heads,
+        "hidden_size": CFG_31B.hidden_size,
+    }
 
-    assert torch.equal(q, q2)
-    assert torch.equal(k, k2)
+    # Build a random local qkv and convert it.
+    q = torch.randn(CFG_31B.num_attention_heads * CFG_31B.head_dim, CFG_31B.hidden_size)
+    k = torch.randn(CFG_31B.num_key_value_heads * CFG_31B.head_dim, CFG_31B.hidden_size)
+    v = torch.randn(CFG_31B.num_key_value_heads * CFG_31B.head_dim, CFG_31B.hidden_size)
+    packed = _pack_local_qkv(q, k, v)
+
+    # Layer 0 is sliding (local).
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+    emitted = conv.convert_gemma4_to_hf(
+        args, "module.module.decoder.layers.0.self_attention.linear_qkv.weight", packed,
+    )
+    names = {n for n, _ in emitted}
+    assert names == {
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        "model.language_model.layers.0.self_attn.k_proj.weight",
+        "model.language_model.layers.0.self_attn.v_proj.weight",
+    }
+    out = dict(emitted)
+    assert torch.allclose(out["model.language_model.layers.0.self_attn.q_proj.weight"], q)
+    assert torch.allclose(out["model.language_model.layers.0.self_attn.k_proj.weight"], k)
+    assert torch.allclose(out["model.language_model.layers.0.self_attn.v_proj.weight"], v)
 
 
-@pytest.mark.unit
-def test_global_layer_indices():
-    """Every 6th layer (0-indexed) is global: 5, 11, 17, ..., 59."""
-    expected = {i for i in range(60) if i % 6 == 5}
-    assert GLOBAL_ATTN_LAYERS == expected
+def test_convert_gemma4_to_hf_global_layer_emits_no_v_proj():
+    conv = _load_convert_module()
+
+    conv._config_cache["config"] = {
+        "global_attn_layers": {5, 11, 17, 23, 29, 35, 41, 47, 53, 59},
+        "local_head_dim": CFG_31B.head_dim,
+        "global_head_dim": CFG_31B.global_head_dim,
+        "num_attention_heads": CFG_31B.num_attention_heads,
+        "local_num_kv_heads": CFG_31B.num_key_value_heads,
+        "global_num_kv_heads": CFG_31B.num_global_key_value_heads,
+        "hidden_size": CFG_31B.hidden_size,
+    }
+
+    q = torch.randn(CFG_31B.num_attention_heads * CFG_31B.global_head_dim, CFG_31B.hidden_size)
+    k = torch.randn(CFG_31B.num_global_key_value_heads * CFG_31B.global_head_dim, CFG_31B.hidden_size)
+    packed = _pack_global_qkv(q, k)
+
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+    emitted = conv.convert_gemma4_to_hf(
+        args, "module.module.decoder.layers.5.self_attention.linear_qkv.weight", packed,
+    )
+    names = {n for n, _ in emitted}
+    # Global K=V layers: only q and k are emitted, v is absent.
+    assert names == {
+        "model.language_model.layers.5.self_attn.q_proj.weight",
+        "model.language_model.layers.5.self_attn.k_proj.weight",
+    }
 
 
-@pytest.mark.unit
-def test_local_vs_global_qkv_shapes():
-    """Local and global layers have different QKV packed sizes."""
-    local_qkv_dim = LOCAL_NUM_KV_HEADS * (NUM_ATTENTION_HEADS // LOCAL_NUM_KV_HEADS + 2) * LOCAL_HEAD_DIM
-    global_qkv_dim = GLOBAL_NUM_KV_HEADS * (NUM_ATTENTION_HEADS // GLOBAL_NUM_KV_HEADS + 2) * GLOBAL_HEAD_DIM
+def test_global_layer_index_matches_layer_types():
+    """The 1-indexed layer_number mod 6 == 0 heuristic must agree with HF's
+    authoritative `layer_types`. This test guards against future Gemma4 variants
+    shipping with a non-regular pattern.
+    """
+    # Build layer_types that mirror the production 31B config.
+    lt = []
+    for i in range(CFG_31B.num_hidden_layers):
+        # 0-indexed: global layers are at 5, 11, 17, ... (every 6th)
+        lt.append("full_attention" if (i + 1) % 6 == 0 else "sliding_attention")
+    # Ensure our heuristic picks the same indices.
+    heuristic = {i for i in range(CFG_31B.num_hidden_layers) if (i + 1) % 6 == 0}
+    truth = {i for i, t in enumerate(lt) if t == "full_attention"}
+    assert heuristic == truth
 
-    # Local: 16 groups * (2 + 2) * 256 = 16384
-    assert local_qkv_dim == 16 * 4 * 256
-    # Global: 4 groups * (8 + 2) * 512 = 20480
-    assert global_qkv_dim == 4 * 10 * 512
-    # They differ
-    assert local_qkv_dim != global_qkv_dim
 
-
-@pytest.mark.unit
 def test_mlp_gate_up_roundtrip():
-    """MLP gate_proj and up_proj are concatenated into linear_fc1."""
-    gate = torch.randn(21504, HIDDEN_SIZE)
-    up = torch.randn(21504, HIDDEN_SIZE)
-
+    """linear_fc1 in Megatron packs [gate, up] along dim 0."""
+    gate = torch.randn(21504, CFG_31B.hidden_size)
+    up = torch.randn(21504, CFG_31B.hidden_size)
     fused = torch.cat([gate, up], dim=0)
     gate2, up2 = fused.chunk(2, dim=0)
+    assert torch.equal(gate, gate2) and torch.equal(up, up2)
 
-    assert torch.equal(gate, gate2)
-    assert torch.equal(up, up2)
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

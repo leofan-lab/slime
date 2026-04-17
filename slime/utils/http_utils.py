@@ -214,16 +214,31 @@ def init_http_client(args):
 
 
 def _get_http_client() -> httpx.AsyncClient:
-    """Get or recreate the HTTP client for the current event loop."""
+    """Get or recreate the HTTP client for the current event loop.
+
+    httpx.AsyncClient binds its connection pool to the loop it was created on.
+    Ray actors can hop loops between call sites; we detect that and rebuild,
+    scheduling the old client's cleanup on its own loop so its sockets get
+    closed (otherwise we leak file descriptors long-running jobs).
+    """
     global _http_client, _http_client_loop_id
     current_loop_id = id(asyncio.get_running_loop())
     if _http_client is None or _http_client_loop_id != current_loop_id:
+        old_client = _http_client
         _http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_connections=max(_client_concurrency, 1)),
             timeout=httpx.Timeout(None),
-            trust_env=False,
+            trust_env=False,  # internal SGLang comm only — never route via system proxy
         )
         _http_client_loop_id = current_loop_id
+        # Best-effort async close on current loop; if the old client was bound
+        # to a dead loop this will raise and we drop it (sockets will still be
+        # closed by GC eventually).
+        if old_client is not None:
+            try:
+                asyncio.get_running_loop().create_task(old_client.aclose())
+            except Exception:
+                pass
     return _http_client
 
 

@@ -5,7 +5,8 @@
 
 MODEL_ARGS=(
    --spec "slime_plugins.models.gemma4" "get_gemma4_spec"
-   --swiglu
+   # Gemma4 uses GeGLU (gated GELU-tanh), not SwiGLU. Activation is set by
+   # get_gemma4_spec; --swiglu is intentionally omitted.
    --num-layers 30
    --hidden-size 2816
    --ffn-hidden-size 2112

@@ -91,10 +91,15 @@ class GenerateState(metaclass=SingletonMeta):
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self._semaphore = asyncio.Semaphore(
+        # Concurrency semaphore must be created per-event-loop: asyncio
+        # primitives bind to the loop that was running when they were
+        # constructed, and Ray actors can serve requests on different loops
+        # across re-entries (e.g. between rollout and eval). We lazily rebind
+        # on loop change in the `semaphore` property below.
+        self._semaphore_value = (
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
-        self._semaphore_value = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self._semaphore = asyncio.Semaphore(self._semaphore_value)
         self._semaphore_loop_id = id(asyncio.get_event_loop())
 
         self.sampling_params: dict[str, Any] = dict(
@@ -121,6 +126,11 @@ class GenerateState(metaclass=SingletonMeta):
 
     @property
     def semaphore(self):
+        # Rebind on event-loop change (see __init__ comment). The old semaphore
+        # is dropped — `asyncio.Semaphore` holds no OS resources, so no cleanup
+        # is needed. Coroutines still inside an `async with state.semaphore`
+        # block on the previous loop continue to use the old object (they hold
+        # a direct reference); new arrivals see the new one.
         current_loop_id = id(asyncio.get_event_loop())
         if current_loop_id != self._semaphore_loop_id:
             self._semaphore = asyncio.Semaphore(self._semaphore_value)

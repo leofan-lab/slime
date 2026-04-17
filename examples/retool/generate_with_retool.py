@@ -216,6 +216,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
 
+    # Reset sample state for retried (previously aborted) samples
+    if sample.rollout_log_probs is not None:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"[RETRY] Resetting stale sample state: rollout_log_probs had {len(sample.rollout_log_probs)} entries, "
+            f"response_length={sample.response_length}, status={sample.status}"
+        )
+    sample.rollout_log_probs = None
+    sample.response = ""
+    sample.response_length = 0
+    sample.loss_mask = None
+
     state = GenerateState(args)
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
@@ -288,6 +300,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             cur_response = output["text"]
             cur_response = postprocess_responses(cur_response)
             cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+            import logging
+            logging.getLogger(__name__).warning(
+                f"[DEBUG] sglang returned without output_token_logprobs! "
+                f"turn={turn}, text_len={len(cur_response)}, token_ids_len={len(cur_response_token_ids)}, "
+                f"finish_reason={output['meta_info']['finish_reason']}, "
+                f"existing_rollout_log_probs_is_none={sample.rollout_log_probs is None}"
+            )
 
         response += cur_response
         response_token_ids += cur_response_token_ids

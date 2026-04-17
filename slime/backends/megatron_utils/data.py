@@ -395,13 +395,6 @@ def get_data_iterator(
             start, end = i * num_local_gbs, (i + 1) * num_local_gbs
             samples = rollout_data["total_lengths"][start:end]
             partitions = get_seqlen_balanced_partitions(samples, num_mbs, equal_size=False)
-            # Fallback: if any partition exceeds the token budget, use cap-aware partitioning
-            if any(sum(samples[idx] for idx in part) > max_tokens for part in partitions):
-                logger.warning(
-                    f"Step {i}: balanced partitioning produced a partition exceeding "
-                    f"max_tokens_per_gpu * cp_size = {max_tokens}, falling back to cap-aware partitioning"
-                )
-                partitions = _get_capped_partitions(samples, num_mbs, max_tokens)
             for j in range(num_mbs):
                 for k in range(len(partitions[j])):
                     partitions[j][k] += start

@@ -91,9 +91,12 @@ class GenerateState(metaclass=SingletonMeta):
         self.tokenizer = load_tokenizer(args.hf_checkpoint, trust_remote_code=True)
         self.processor = load_processor(args.hf_checkpoint, trust_remote_code=True)
 
-        self.semaphore = asyncio.Semaphore(
+        self._semaphore = asyncio.Semaphore(
             args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
         )
+        self._semaphore_value = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
+        self._semaphore_loop_id = id(asyncio.get_event_loop())
+
         self.sampling_params: dict[str, Any] = dict(
             temperature=args.rollout_temperature,
             top_p=args.rollout_top_p,
@@ -115,6 +118,14 @@ class GenerateState(metaclass=SingletonMeta):
         self.dp_rank = 0
 
         self.reset()
+
+    @property
+    def semaphore(self):
+        current_loop_id = id(asyncio.get_event_loop())
+        if current_loop_id != self._semaphore_loop_id:
+            self._semaphore = asyncio.Semaphore(self._semaphore_value)
+            self._semaphore_loop_id = current_loop_id
+        return self._semaphore
 
     @contextmanager
     def dp_rank_context(self):

@@ -232,27 +232,43 @@ class MegatronTrainRayActor(TrainRayActor):
         for key in ["rollout_log_probs", "teacher_log_probs"]:
             if key not in rollout_data:
                 continue
-            rollout_data[key] = [
-                torch.tensor(
-                    slice_log_prob_with_cp(
-                        log_prob,
-                        total_length,
-                        response_length,
-                        self.args.qkv_format,
-                        rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
-                    ),
-                    device=torch.cuda.current_device(),
-                    dtype=torch.float32,
+            processed = []
+            for i, (log_prob, total_length, response_length) in enumerate(
+                zip(
+                    rollout_data[key],
+                    rollout_data["total_lengths"],
+                    rollout_data["response_lengths"],
+                    strict=False,
                 )
-                for i, (log_prob, total_length, response_length) in enumerate(
-                    zip(
-                        rollout_data[key],
-                        rollout_data["total_lengths"],
-                        rollout_data["response_lengths"],
-                        strict=False,
+            ):
+                lp_len = len(log_prob) if log_prob is not None else None
+                if lp_len != response_length:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.error(
+                        f"[DEBUG] slice_log_prob_with_cp mismatch at sample {i}, key={key}: "
+                        f"len(log_prob)={lp_len}, response_length={response_length}, "
+                        f"total_length={total_length}, "
+                        f"tokens_len={len(rollout_data['tokens'][i]) if 'tokens' in rollout_data else 'N/A'}, "
+                        f"loss_mask_len={len(rollout_data['loss_masks'][i]) if 'loss_masks' in rollout_data else 'N/A'}, "
+                        f"log_prob_type={type(log_prob).__name__}, "
+                        f"log_prob_first5={log_prob[:5] if log_prob is not None and len(log_prob) > 0 else 'empty'}, "
+                        f"log_prob_last5={log_prob[-5:] if log_prob is not None and len(log_prob) > 0 else 'empty'}"
+                    )
+                processed.append(
+                    torch.tensor(
+                        slice_log_prob_with_cp(
+                            log_prob,
+                            total_length,
+                            response_length,
+                            self.args.qkv_format,
+                            rollout_data["max_seq_lens"][i] if self.args.qkv_format == "bshd" else None,
+                        ),
+                        device=torch.cuda.current_device(),
+                        dtype=torch.float32,
                     )
                 )
-            ]
+            rollout_data[key] = processed
         if "rollout_routed_experts" in rollout_data:
             rollout_data["rollout_routed_experts"] = [
                 torch.from_numpy(r) for r in rollout_data["rollout_routed_experts"]

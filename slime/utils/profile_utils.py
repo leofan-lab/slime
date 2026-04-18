@@ -77,6 +77,13 @@ def _profile_simple_loop(iterator, args, name):
 
 
 def _create_torch_profiler(args, name):
+    # `record_shapes=True` + `with_flops=True` on a 26B MoE with active=1
+    # (= one full rollout under the current wiring, ~45 min of kernel events)
+    # produces >10 GB gzipped trace files that take hours to serialize and
+    # don't load in Chrome/Perfetto. Kept off by default; flip via env var for
+    # tighter windows where the extra metadata is worth the cost.
+    record_shapes = os.environ.get("SLIME_PROFILE_RECORD_SHAPES", "0") not in ("0", "", "false", "False")
+    with_flops = os.environ.get("SLIME_PROFILE_WITH_FLOPS", "0") not in ("0", "", "false", "False")
     return torch.profiler.profile(
         schedule=torch.profiler.schedule(
             # TODO the train_actor and train_log_probs ones may need to have different args to control step
@@ -90,8 +97,8 @@ def _create_torch_profiler(args, name):
             worker_name=f"{name}_rank_{torch.distributed.get_rank()}",
             use_gzip=True,
         ),
-        record_shapes=True,
-        with_flops=True,
+        record_shapes=record_shapes,
+        with_flops=with_flops,
     )
 
 

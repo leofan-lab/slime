@@ -1,4 +1,5 @@
 import logging
+import os
 import time
 import traceback
 from pathlib import Path
@@ -10,16 +11,30 @@ from slime.utils.memory_utils import print_memory
 logger = logging.getLogger(__name__)
 
 
+def _should_profile_this_rank() -> bool:
+    """Only rank 0 profiles by default. Each rank holds a full torch.profiler
+    buffer during the active window (~60 GB on a 26B MoE), so running on all
+    16 ranks adds ~1 TB of host RAM pressure and has caused host-OOM kills.
+    Set SLIME_PROFILE_ALL_RANKS=1 to opt into per-rank traces when diagnosing
+    cross-rank sync or PP-stage imbalance.
+    """
+    if os.environ.get("SLIME_PROFILE_ALL_RANKS", "0") not in ("0", "", "false", "False"):
+        return True
+    if not torch.distributed.is_initialized():
+        return True
+    return torch.distributed.get_rank() == 0
+
+
 class TrainProfiler:
     def __init__(self, args):
         self.args = args
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
 
-        if args.use_pytorch_profiler and ("train_overall" in args.profile_target):
+        if args.use_pytorch_profiler and ("train_overall" in args.profile_target) and _should_profile_this_rank():
             self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
 
-        if args.record_memory_history and ("train_overall" in args.profile_target):
+        if args.record_memory_history and ("train_overall" in args.profile_target) and _should_profile_this_rank():
             self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
             self._memory_profiler_overall.start()
 
@@ -46,7 +61,11 @@ class TrainProfiler:
 
 
 def _profile_simple_loop(iterator, args, name):
-    if not (args.use_pytorch_profiler and (name in args.profile_target)):
+    if not (
+        args.use_pytorch_profiler
+        and (name in args.profile_target)
+        and _should_profile_this_rank()
+    ):
         yield from iterator
         return
 

@@ -26,23 +26,55 @@ def _should_profile_this_rank() -> bool:
 
 
 class TrainProfiler:
+    """Manages torch.profiler and memory profilers across training phases.
+
+    Three mutually-exclusive profile targets:
+
+    - ``train_overall`` — one active window covers a full rollout
+      (ref_log_probs + log_probs + actor_train + update_weights). Useful for
+      cumulative stats but produces huge traces (8+ GB gzipped on a 26B MoE).
+    - ``train_actor`` — one active window covers a single grad-accum step
+      inside ``actor_train``. Trace is ~500× smaller (~15 MB) and actually
+      openable in Perfetto/Chrome. Hooked via ``step_train_actor`` at the
+      boundary of each step in ``megatron_utils/model.py::train``.
+    - ``train_log_probs`` — one active window per log-probs forward. Hooked
+      via ``step_train_log_probs``.
+
+    Only one is active at a time: ``--profile-target`` is a single-item list
+    today, but the code paths independently check membership so multiple can
+    in principle coexist.
+    """
+
     def __init__(self, args):
         self.args = args
         self._torch_profiler_overall = None
         self._memory_profiler_overall = None
+        self._torch_profiler_train_actor = None
+        self._torch_profiler_train_actor_started = False
+        self._torch_profiler_train_log_probs = None
+        self._torch_profiler_train_log_probs_started = False
 
-        if args.use_pytorch_profiler and ("train_overall" in args.profile_target) and _should_profile_this_rank():
-            self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
-
-        if args.record_memory_history and ("train_overall" in args.profile_target) and _should_profile_this_rank():
-            self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
-            self._memory_profiler_overall.start()
+        if _should_profile_this_rank():
+            if args.use_pytorch_profiler and ("train_overall" in args.profile_target):
+                self._torch_profiler_overall = _create_torch_profiler(args, name="train_overall")
+            if args.use_pytorch_profiler and ("train_actor" in args.profile_target):
+                self._torch_profiler_train_actor = _create_torch_profiler(args, name="train_actor")
+            if args.use_pytorch_profiler and ("train_log_probs" in args.profile_target):
+                self._torch_profiler_train_log_probs = _create_torch_profiler(args, name="train_log_probs")
+            if args.record_memory_history and ("train_overall" in args.profile_target):
+                self._memory_profiler_overall = _BaseMemoryProfiler.create(args)
+                self._memory_profiler_overall.start()
 
     def on_init_end(self):
+        # Only the train_overall profiler starts at init; the per-step ones
+        # start lazily on their first tick so they don't waste a warmup slot
+        # on code that runs before training begins.
         if self._torch_profiler_overall is not None:
             self._torch_profiler_overall.start()
 
     def step(self, rollout_id: int):
+        """Called once per rollout from the actor loop. Advances the
+        train_overall profiler's state machine."""
         if self._torch_profiler_overall is not None:
             self._torch_profiler_overall.step()
 
@@ -52,6 +84,25 @@ class TrainProfiler:
             and (rollout_id == s - 1)
         ):
             self._memory_profiler_overall.stop()
+
+    def step_train_actor(self):
+        """Called at each grad-accum step boundary inside ``actor_train``.
+        Each call advances the train_actor profiler by one tick."""
+        if self._torch_profiler_train_actor is None:
+            return
+        if not self._torch_profiler_train_actor_started:
+            self._torch_profiler_train_actor.start()
+            self._torch_profiler_train_actor_started = True
+        self._torch_profiler_train_actor.step()
+
+    def step_train_log_probs(self):
+        """Called at each log-probs forward-step boundary."""
+        if self._torch_profiler_train_log_probs is None:
+            return
+        if not self._torch_profiler_train_log_probs_started:
+            self._torch_profiler_train_log_probs.start()
+            self._torch_profiler_train_log_probs_started = True
+        self._torch_profiler_train_log_probs.step()
 
     def iterate_train_actor(self, iterator):
         return _profile_simple_loop(iterator, self.args, name="train_actor")

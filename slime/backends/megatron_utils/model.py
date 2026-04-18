@@ -497,6 +497,7 @@ def train(
     opt_param_scheduler: OptimizerParamScheduler,
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
+    step_callback: Callable[[], None] | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -600,6 +601,13 @@ def train(
             opt_param_scheduler,
             num_microbatches[step_id],
         )
+
+        # Advance the train_actor profiler (if active) one tick per grad-accum
+        # step. The torch.profiler schedule (wait/warmup/active/repeat) decides
+        # which step actually captures; most ticks are no-ops. Kept out of the
+        # hot path by the callback being None when profiling is disabled.
+        if step_callback is not None:
+            step_callback()
 
         if step_id == 0:
             # Enable forward pre-hook after training step has successfully run. All subsequent

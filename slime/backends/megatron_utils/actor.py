@@ -93,6 +93,33 @@ class MegatronTrainRayActor(TrainRayActor):
             args, role
         )
 
+        # One-off diagnostic: when GEMMA4_DUMP_WEIGHTS_PATH is set, rank 0 writes
+        # a subset of the loaded Megatron weights to that file (as a .pt with a
+        # few named tensors). Use this to verify the ckpt-loaded model's weights
+        # match the HF source. Helps triage "update_weights succeeds but sglang
+        # produces NaN" scenarios where the ckpt appears valid on disk but the
+        # runtime model has subtly wrong values.
+        _dump_path = os.environ.get("GEMMA4_DUMP_WEIGHTS_PATH")
+        if _dump_path and torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
+            try:
+                sample = {}
+                for name, p in self.model[0].named_parameters():
+                    # keep a small, deterministic sample so the dump fits in a file
+                    if any(
+                        marker in name for marker in (
+                            "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
+                            "decoder.layers.0.self_attention.linear_proj.weight",
+                            "decoder.layers.0.dense_mlp.linear_fc2.weight",
+                            "decoder.layers.0.mlp.router.scale",
+                        )
+                    ):
+                        sample[name] = p.detach().float().cpu().clone()
+                os.makedirs(os.path.dirname(_dump_path), exist_ok=True)
+                torch.save(sample, _dump_path)
+                print(f"[GEMMA4_DUMP] wrote {len(sample)} tensors to {_dump_path}")
+            except Exception as e:
+                print(f"[GEMMA4_DUMP] failed: {type(e).__name__}: {e}")
+
         start_rollout_id = loaded_rollout_id + 1
 
         if role == "critic":

@@ -1,8 +1,30 @@
+import os
 import re
 import torch
 
 
 _config_cache = {}
+
+_DEBUG_LOG_PATH = os.environ.get("GEMMA4_CONVERT_DEBUG_LOG")
+_debug_log_handle = None
+
+
+def _debug_log(name: str, shape=None):
+    """If GEMMA4_CONVERT_DEBUG_LOG is set, append each emitted name+shape to it.
+    Intended for one-off diagnosis of what our converter is actually producing
+    so we can diff against sglang's params_dict."""
+    global _debug_log_handle
+    if _DEBUG_LOG_PATH is None:
+        return
+    if _debug_log_handle is None:
+        try:
+            _debug_log_handle = open(_DEBUG_LOG_PATH, "a", buffering=1)
+        except Exception:
+            return
+    try:
+        _debug_log_handle.write(f"{name}\t{tuple(shape) if shape is not None else ''}\n")
+    except Exception:
+        pass
 
 # Per-layer buffers for stacked expert tensors. sglang's Gemma4 loader expects
 # `experts.gate_up_proj` as a single 3D tensor of shape [E, 2I, H] and
@@ -33,6 +55,14 @@ def _get_config(args):
             "num_experts": getattr(hf_text, "num_experts", 0),
         }
     return _config_cache["config"]
+
+
+def _log_emitted(emitted):
+    """Helper: log everything this call is about to return to stdout
+    if GEMMA4_CONVERT_DEBUG_LOG is set."""
+    for n, t in emitted:
+        _debug_log(n, t.shape)
+    return emitted
 
 
 def convert_gemma4_to_hf(args, name, param):

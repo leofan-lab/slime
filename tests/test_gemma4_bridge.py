@@ -160,5 +160,102 @@ def test_mlp_gate_up_roundtrip():
     assert torch.equal(gate, gate2) and torch.equal(up, up2)
 
 
+def test_convert_gemma4_to_hf_moe_expert_weights():
+    """Per-expert fc1/fc2 weights (from TEGroupedLinear) map to HF-indexed entries.
+
+    Under the new MoELayer-based architecture, each local expert emits
+    parameters like `mlp.experts.linear_fc1.weight5` (where 5 is the GLOBAL
+    expert index after local→global remap). They should convert to HF-style
+    per-expert keys that sglang can consume.
+    """
+    conv = _load_convert_module()
+    conv._config_cache["config"] = {
+        "global_attn_layers": {5},
+        "local_head_dim": 256, "global_head_dim": 512,
+        "num_attention_heads": 16,
+        "local_num_kv_heads": 8, "global_num_kv_heads": 2,
+        "hidden_size": 2816,
+    }
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+
+    # linear_fc1.weight{E}: [2*I, H] (gate stacked with up)
+    param_fc1 = torch.randn(2 * 704, 2816)
+    emitted = conv.convert_gemma4_to_hf(
+        args, "module.module.decoder.layers.3.mlp.experts.linear_fc1.weight7", param_fc1,
+    )
+    assert len(emitted) == 1
+    name, tensor = emitted[0]
+    assert name == "model.language_model.layers.3.experts.7.gate_up_proj.weight"
+    assert tensor.shape == (2 * 704, 2816)
+
+    # linear_fc2.weight{E}: [H, I]
+    param_fc2 = torch.randn(2816, 704)
+    emitted = conv.convert_gemma4_to_hf(
+        args, "module.module.decoder.layers.3.mlp.experts.linear_fc2.weight7", param_fc2,
+    )
+    assert len(emitted) == 1
+    name, tensor = emitted[0]
+    assert name == "model.language_model.layers.3.experts.7.down_proj.weight"
+    assert tensor.shape == (2816, 704)
+
+
+def test_convert_gemma4_to_hf_moe_router_weights():
+    """Router lives at `.mlp.router.*` under the MoE variant since
+    `self.mlp = Gemma4MoELayer` for MoE-enabled layers."""
+    conv = _load_convert_module()
+    conv._config_cache["config"] = {
+        "global_attn_layers": {5},
+        "local_head_dim": 256, "global_head_dim": 512,
+        "num_attention_heads": 16,
+        "local_num_kv_heads": 8, "global_num_kv_heads": 2,
+        "hidden_size": 2816,
+    }
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+    for mcore_rest, hf_tail in [
+        ("mlp.router.proj.weight", "router.proj.weight"),
+        ("mlp.router.scale", "router.scale"),
+        ("mlp.router.per_expert_scale", "router.per_expert_scale"),
+    ]:
+        param = torch.randn(4)
+        emitted = conv.convert_gemma4_to_hf(
+            args, f"module.module.decoder.layers.3.{mcore_rest}", param,
+        )
+        assert len(emitted) == 1
+        assert emitted[0][0] == f"model.language_model.layers.3.{hf_tail}"
+
+
+def test_convert_gemma4_to_hf_dense_mlp_sibling():
+    """Under MoE variant the parallel dense MLP lives at `.dense_mlp.*`; it
+    must still map to HF's `.mlp.*` since HF uses a single MLP naming."""
+    conv = _load_convert_module()
+    conv._config_cache["config"] = {
+        "global_attn_layers": set(),
+        "local_head_dim": 256, "global_head_dim": 512,
+        "num_attention_heads": 16,
+        "local_num_kv_heads": 8, "global_num_kv_heads": 2,
+        "hidden_size": 2816,
+    }
+    args = SimpleNamespace(hf_checkpoint="/nonexistent")
+
+    gate = torch.randn(2112, 2816)
+    up = torch.randn(2112, 2816)
+    fused = torch.cat([gate, up], dim=0)
+
+    emitted = conv.convert_gemma4_to_hf(
+        args, "module.module.decoder.layers.0.dense_mlp.linear_fc1.weight", fused,
+    )
+    names = {n for n, _ in emitted}
+    assert names == {
+        "model.language_model.layers.0.mlp.gate_proj.weight",
+        "model.language_model.layers.0.mlp.up_proj.weight",
+    }
+
+    down = torch.randn(2816, 2112)
+    emitted = conv.convert_gemma4_to_hf(
+        args, "module.module.decoder.layers.0.dense_mlp.linear_fc2.weight", down,
+    )
+    assert emitted == [("model.language_model.layers.0.mlp.down_proj.weight", down)]
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

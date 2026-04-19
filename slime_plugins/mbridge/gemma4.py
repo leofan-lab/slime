@@ -40,7 +40,12 @@ class Gemma4Bridge(Gemma3Bridge):
         ],
     }
 
+    # Dense MLP entries. For the 31B dense variant these map the single `.mlp`
+    # submodule directly. For the 26B-A4B MoE variant `.mlp` is the MoE block
+    # and the dense feed-forward lives at `.dense_mlp` — we map both so state-
+    # dict round-trips work regardless of variant.
     _MLP_MAPPING = {
+        # 31B dense variant: `.mlp` is the dense MLP.
         "decoder.layers.{layer_number}.mlp.linear_fc1.weight": [
             "model.language_model.layers.{layer_number}.mlp.gate_proj.weight",
             "model.language_model.layers.{layer_number}.mlp.up_proj.weight",
@@ -54,6 +59,28 @@ class Gemma4Bridge(Gemma3Bridge):
         "decoder.layers.{layer_number}.pre_mlp_layernorm.weight": [
             "model.language_model.layers.{layer_number}.pre_feedforward_layernorm.weight",
         ],
+        # 26B-A4B MoE variant: `.dense_mlp` is the parallel dense feed-forward.
+        "decoder.layers.{layer_number}.dense_mlp.linear_fc1.weight": [
+            "model.language_model.layers.{layer_number}.mlp.gate_proj.weight",
+            "model.language_model.layers.{layer_number}.mlp.up_proj.weight",
+        ],
+        "decoder.layers.{layer_number}.dense_mlp.linear_fc2.weight": [
+            "model.language_model.layers.{layer_number}.mlp.down_proj.weight",
+        ],
+        "decoder.layers.{layer_number}.dense_mlp.linear_fc1.layer_norm_weight": [
+            "model.language_model.layers.{layer_number}.pre_feedforward_layernorm.weight",
+        ],
+        # MoE router weights (live under `.mlp.router.*` since self.mlp is the
+        # Gemma4MoELayer in the MoE variant).
+        "decoder.layers.{layer_number}.mlp.router.proj.weight": [
+            "model.language_model.layers.{layer_number}.router.proj.weight",
+        ],
+        "decoder.layers.{layer_number}.mlp.router.scale": [
+            "model.language_model.layers.{layer_number}.router.scale",
+        ],
+        "decoder.layers.{layer_number}.mlp.router.per_expert_scale": [
+            "model.language_model.layers.{layer_number}.router.per_expert_scale",
+        ],
     }
 
     _OTHER_MAPPING = {
@@ -66,22 +93,9 @@ class Gemma4Bridge(Gemma3Bridge):
         "decoder.layers.{layer_number}.layer_scalar": [
             "model.language_model.layers.{layer_number}.layer_scalar",
         ],
-        # MoE (26B-A4B)
-        "decoder.layers.{layer_number}.router.proj.weight": [
-            "model.language_model.layers.{layer_number}.router.proj.weight",
-        ],
-        "decoder.layers.{layer_number}.router.scale": [
-            "model.language_model.layers.{layer_number}.router.scale",
-        ],
-        "decoder.layers.{layer_number}.router.per_expert_scale": [
-            "model.language_model.layers.{layer_number}.router.per_expert_scale",
-        ],
-        "decoder.layers.{layer_number}.experts.gate_up_proj": [
-            "model.language_model.layers.{layer_number}.experts.gate_up_proj",
-        ],
-        "decoder.layers.{layer_number}.experts.down_proj": [
-            "model.language_model.layers.{layer_number}.experts.down_proj",
-        ],
+        # MoE variant extra layernorms that wrap the dense + MoE paths before
+        # summing. These live on the transformer layer directly (not under
+        # `.mlp` or `.dense_mlp`).
         "decoder.layers.{layer_number}.pre_feedforward_layernorm_2.weight": [
             "model.language_model.layers.{layer_number}.pre_feedforward_layernorm_2.weight",
         ],
@@ -92,6 +106,17 @@ class Gemma4Bridge(Gemma3Bridge):
             "model.language_model.layers.{layer_number}.post_feedforward_layernorm_1.weight",
         ],
     }
+
+    # Matches per-expert linear weights emitted by TEGroupedLinear:
+    #   decoder.layers.<L>.mlp.experts.linear_fc1.weight<E>
+    #   decoder.layers.<L>.mlp.experts.linear_fc2.weight<E>
+    # where <L> is the layer number and <E> is the GLOBAL expert index
+    # (after mbridge base's `_weight_name_mapping_mcore_local_to_global`
+    # has remapped local→global across EP ranks — its built-in logic
+    # handles the `.mlp.experts.linear_fc` pattern automatically).
+    _RE_MOE_EXPERT = re.compile(
+        r"^decoder\.layers\.(\d+)\.mlp\.experts\.linear_fc([12])\.weight(\d+)$"
+    )
 
     _DIRECT_MAPPING = {
         "embedding.word_embeddings.weight": "model.language_model.embed_tokens.weight",
@@ -128,6 +153,18 @@ class Gemma4Bridge(Gemma3Bridge):
         return [x.format(layer_number=layer_number) for x in self._ATTENTION_MAPPING[key]]
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
+        # Per-expert MoE weight: Megatron names the per-expert tensors
+        # `mlp.experts.linear_fc{1,2}.weight{E}`. HF stores the 3D stacked
+        # tensors `experts.gate_up_proj` / `experts.down_proj`; we slice the
+        # expert row out in `_weight_to_mcore_format`.
+        m = self._RE_MOE_EXPERT.match(name)
+        if m:
+            layer_number, fc, _expert_idx = m.group(1), m.group(2), m.group(3)
+            hf_tensor = "gate_up_proj" if fc == "1" else "down_proj"
+            return [
+                f"model.language_model.layers.{layer_number}.experts.{hf_tensor}",
+            ]
+
         split_name = name.split(".")
         layer_number = split_name[2]
         split_name[2] = "{layer_number}"
@@ -142,6 +179,19 @@ class Gemma4Bridge(Gemma3Bridge):
         return [x.format(layer_number=layer_number) for x in self._OTHER_MAPPING[key]]
 
     def _weight_to_mcore_format(self, mcore_weights_name, hf_weights):
+        # Per-expert MoE weight: slice the global 3D HF tensor down to one
+        # expert row. The expert index is encoded in the mcore name by
+        # `_weight_name_mapping_mcore_local_to_global`, which rewrites local
+        # weight{j} → weight{global_expert_idx}.
+        m = self._RE_MOE_EXPERT.match(mcore_weights_name)
+        if m:
+            expert_idx = int(m.group(3))
+            assert len(hf_weights) == 1, (
+                f"expected exactly one HF tensor for expert weight, got {len(hf_weights)}"
+            )
+            # HF shape: [num_experts, out_dim, in_dim]. Slice to [out_dim, in_dim].
+            return hf_weights[0][expert_idx].contiguous()
+
         if len(hf_weights) == 1:
             return hf_weights[0]
 

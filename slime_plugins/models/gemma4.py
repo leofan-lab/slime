@@ -7,6 +7,10 @@ Extends the Gemma3 implementation from mbridge with Gemma4-specific features:
 - v_norm: RMSNorm without learnable scale applied to V states.
 - layer_scalar: buffer multiplied after residual (not learned).
 - final_logit_softcapping: applied to output logits in the model wrapper.
+- MoE block (26B-A4B): Gemma4's custom router (with per-expert scale) plugged
+  into Megatron's MoE infrastructure for proper expert-parallel sharding.
+  The router is still custom (see Gemma4Router); dispatching + grouped-GEMM
+  come from Megatron's MoELayer + TEGroupedMLP.
 """
 
 import functools
@@ -20,6 +24,7 @@ from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubm
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules, BaseMoELayer
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import make_viewless_tensor
@@ -72,6 +77,11 @@ class VNorm(nn.Module):
 class Gemma4TransformerLayerSubmodules(TransformerLayerSubmodules):
     post_attention_layernorm: ModuleSpec | type = IdentityOp
     post_feedforward_layernorm: ModuleSpec | type = IdentityOp
+    # For MoE-enabled variants (26B-A4B), the primary `mlp` submodule is swapped
+    # to a Gemma4MoELayer and the original dense MLP moves to `dense_mlp`. This
+    # keeps the `.mlp.experts.linear_fc...` naming that mbridge's EP auto-handling
+    # expects while preserving Gemma4's dense+MoE-in-parallel structure.
+    dense_mlp: ModuleSpec | type = IdentityOp
 
 
 class Gemma4Router(nn.Module):
@@ -100,41 +110,104 @@ class Gemma4Router(nn.Module):
         return top_k_weights, top_k_index
 
 
-class Gemma4Experts(nn.Module):
-    """Gemma4 MoE experts with fused 3D gate_up_proj/down_proj tensors."""
+class Gemma4MoELayer(MoELayer):
+    """Gemma4 MoE block: Megatron's MoELayer with Gemma4's custom router.
 
-    def __init__(self, config):
-        super().__init__()
-        self.num_experts = config.num_moe_experts
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.moe_ffn_hidden_size
-        self.gate_up_proj = nn.Parameter(
-            torch.empty(self.num_experts, 2 * self.intermediate_size, self.hidden_size)
-        )
-        self.down_proj = nn.Parameter(
-            torch.empty(self.num_experts, self.hidden_size, self.intermediate_size)
-        )
-        self.act_fn = _gelu_tanh
+    Megatron's MoELayer hardcodes its own ``TopKRouter`` which uses a
+    softmax-with-expert-bias scheme. Gemma4 has its own router semantics
+    (no-scale RMSNorm → learnable per-hidden scale → proj → softmax → topk →
+    per-expert scale multiplier). We reuse all of Megatron's infrastructure
+    for dispatching (alltoall), expert parallelism, and grouped-GEMM expert
+    computation — but swap in our ``Gemma4Router`` and convert its compact
+    (top_k_weights [T, K], top_k_index [T, K]) output into Megatron's
+    expected (probs [T, E], routing_map [T, E]) format inside ``route()``.
+    """
 
-    def forward(self, hidden_states, top_k_index, top_k_weights):
-        # hidden_states: [tokens, hidden_size]
-        final = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)  # [E, K, T]
-        for expert_idx in expert_mask.sum(dim=(-1, -2)).nonzero(as_tuple=True)[0]:
-            # HF keeps a sentinel "no expert" index at num_experts for drop-token
-            # routing; guard for parity even though softmax-based routing can't
-            # emit it today.
-            if int(expert_idx) == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            x = hidden_states[token_idx]
-            gate, up = F.linear(x, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
-            out = F.linear(self.act_fn(gate) * up, self.down_proj[expert_idx])
-            out = out * top_k_weights[token_idx, top_k_pos, None]
-            final.index_add_(0, token_idx, out.to(final.dtype))
-        return final
+    def __init__(self, config, submodules=None, layer_number=None, pg_collection=None):
+        # Bypass MoELayer.__init__ so we can avoid building Megatron's TopKRouter,
+        # then run the rest of MoELayer's setup ourselves. The parts we need:
+        # - self.ep_group / num_local_experts / local_expert_indices (from BaseMoELayer)
+        # - token_dispatcher, experts (alltoall path, GroupedMLP)
+        # Anything shared-expert related is disabled: Gemma4 has no shared experts in
+        # this sense — its "dense MLP" lives outside the MoE block in the parent layer.
+        BaseMoELayer.__init__(
+            self, config=config, layer_number=layer_number, pg_collection=pg_collection
+        )
+        # Disable Megatron-checkpoint paths that don't apply here.
+        self.moe_layer_recompute = False
+        self.shared_experts_recompute = False
+        self.submodules = submodules
+
+        # --- Router: Gemma4's custom router, not TopKRouter. ---
+        self.router = Gemma4Router(config)
+
+        # --- Token dispatcher (identical to MoELayer.__init__). ---
+        from megatron.core.transformer.moe.token_dispatcher import (
+            MoEAllGatherTokenDispatcher,
+            MoEAlltoAllTokenDispatcher,
+            MoEFlexTokenDispatcher,
+        )
+        if config.moe_token_dispatcher_type == "allgather":
+            self.token_dispatcher = MoEAllGatherTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices,
+                config=self.config, pg_collection=pg_collection,
+            )
+        elif config.moe_token_dispatcher_type == "alltoall":
+            self.token_dispatcher = MoEAlltoAllTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices,
+                config=self.config, pg_collection=pg_collection,
+            )
+        elif config.moe_token_dispatcher_type == "flex":
+            self.token_dispatcher = MoEFlexTokenDispatcher(
+                self.num_local_experts, self.local_expert_indices,
+                config=self.config, pg_collection=pg_collection,
+            )
+        else:
+            raise ValueError(f"Unsupported token dispatcher type: {config.moe_token_dispatcher_type}")
+
+        # --- Experts: Megatron's GroupedMLP / TEGroupedMLP. ---
+        self.experts = build_module(
+            self.submodules.experts,
+            self.num_local_experts,
+            self.config,
+            pg_collection=pg_collection,
+        )
+
+        # Gemma4 doesn't use shared experts in Megatron's sense.
+        self.shared_experts = None
+
+        # cudagraph tensor store (required by MoELayer.forward decorators)
+        from megatron.core.transformer.moe.moe_utils import MoECudaGraphTensorStore
+        self.cudagraph_tensor_store = MoECudaGraphTensorStore()
+
+    def route(self, hidden_states: torch.Tensor):
+        """Call Gemma4Router and pack its output into Megatron's (probs, routing_map).
+
+        Gemma4Router expects a flattened [T, H] tensor and returns compact top-k:
+            top_k_weights: [T, K] — routing weights (already scaled by per_expert_scale)
+            top_k_index:   [T, K] — which experts each token routes to
+        Megatron's dispatcher wants:
+            probs:       [T, E] — weight per (token, expert), 0 where not routed
+            routing_map: [T, E] — boolean mask
+        """
+        orig_shape = hidden_states.shape
+        flat = hidden_states.view(-1, orig_shape[-1])
+        top_k_weights, top_k_index = self.router(flat)
+
+        num_tokens = flat.shape[0]
+        num_experts = self.config.num_moe_experts
+        probs = torch.zeros(
+            num_tokens, num_experts,
+            dtype=top_k_weights.dtype, device=top_k_weights.device,
+        )
+        probs.scatter_(1, top_k_index, top_k_weights)
+        routing_map = probs != 0
+        return probs, routing_map
+
+    # BaseMoELayer.forward is abstract; MoELayer defines a concrete forward
+    # that we inherit. It calls self.route → self.preprocess → self.dispatch →
+    # self.routed_experts_compute → self.combine. All of those work with
+    # Megatron's (probs, routing_map) format that our route() now produces.
 
 
 class Gemma4TransformerLayer(TransformerLayer):
@@ -207,11 +280,19 @@ class Gemma4TransformerLayer(TransformerLayer):
         # Layer scalar (buffer, not learned)
         self.register_buffer("layer_scalar", torch.ones(1))
 
-        # MoE block (26B-A4B): router + experts + extra layernorms
+        # MoE block (26B-A4B): super().__init__ already built self.mlp from the
+        # layer spec, which when enable_moe_block=True is a Gemma4MoELayer (not
+        # a dense MLP). We also build a parallel `dense_mlp` for Gemma4's
+        # dense + MoE combined-FFN pattern. The two outputs are summed in
+        # forward().
         self.enable_moe_block = getattr(config, 'enable_moe_block', False)
         if self.enable_moe_block:
-            self.router = Gemma4Router(config)
-            self.experts = Gemma4Experts(config)
+            # Parallel dense MLP branch (sibling to self.mlp, which is the MoE).
+            self.dense_mlp = build_module(
+                submodules.dense_mlp,
+                config=config,
+            )
+            # Gemma4 pre/post layernorms that wrap the two FFN paths.
             self.post_feedforward_layernorm_1 = TENorm(
                 config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon,
             )
@@ -292,25 +373,34 @@ class Gemma4TransformerLayer(TransformerLayer):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
-        # MLP (dense path)
+        # FFN path. Two shapes depending on whether this is a MoE-enabled layer:
+        #   - dense (31B):  `self.mlp` IS the dense MLP; nothing else to do.
+        #   - MoE (26B-A4B): `self.mlp` is a Gemma4MoELayer (so mcore state-dict
+        #     paths look like `.mlp.experts.linear_fc*.weight*` and match the
+        #     mbridge EP handling). The parallel dense path lives in
+        #     `self.dense_mlp` and is summed with the MoE output, matching
+        #     Gemma4's HF reference which runs both feed-forwards per layer.
         residual = hidden_states
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
-        hidden_states, hidden_states_bias = self.mlp(pre_mlp_layernorm_output)
-        if hidden_states_bias is not None:
-            hidden_states = hidden_states + hidden_states_bias
 
-        # MoE path: dense MLP + experts are summed, then post_feedforward_layernorm, then residual
         if self.enable_moe_block:
-            mlp_output = self.post_feedforward_layernorm_1(hidden_states)
+            # Dense MLP is the "main" feed-forward in HF terminology; it
+            # passes through `post_feedforward_layernorm_1` before summing.
+            dense_out, dense_bias = self.dense_mlp(pre_mlp_layernorm_output)
+            if dense_bias is not None:
+                dense_out = dense_out + dense_bias
+            mlp_output = self.post_feedforward_layernorm_1(dense_out)
 
-            flat = residual.view(-1, residual.shape[-1])
-            top_k_weights, top_k_index = self.router(flat)
-            moe_input = self.pre_feedforward_layernorm_2(flat)
-            moe_output = self.experts(moe_input, top_k_index, top_k_weights)
-            moe_output = moe_output.view_as(residual)
+            # MoE input uses a dedicated pre-norm (HF's `pre_feedforward_layernorm_2`).
+            moe_input = self.pre_feedforward_layernorm_2(residual)
+            moe_output, _ = self.mlp(moe_input)  # Gemma4MoELayer returns (output, mlp_bias=None)
             moe_output = self.post_feedforward_layernorm_2(moe_output)
 
             hidden_states = mlp_output + moe_output
+        else:
+            hidden_states, hidden_states_bias = self.mlp(pre_mlp_layernorm_output)
+            if hidden_states_bias is not None:
+                hidden_states = hidden_states + hidden_states_bias
 
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
@@ -610,36 +700,74 @@ class Gemma4SelfAttention(SelfAttention):
         return query, key, value
 
 
-def get_gemma4_layer_spec_te() -> ModuleSpec:
-    """Layer spec for Gemma4 using native Megatron attention with TE."""
+def _build_moe_submodule_spec(config):
+    """Build the MoE submodule spec (Gemma4MoELayer + TE GroupedMLP experts)."""
+    from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+    from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+
+    # Reuse Megatron's canonical TE-backed MoE spec factory to get
+    # TEColumnParallelGroupedLinear / TERowParallelGroupedLinear etc. wired up
+    # properly for GroupedMLP experts. Then swap the top-level module from
+    # Megatron's MoELayer to our Gemma4MoELayer, which keeps all that wiring
+    # but plugs in Gemma4Router.
+    base_spec = get_moe_module_spec_for_backend(
+        backend=TESpecProvider(),
+        num_experts=config.num_moe_experts,
+        moe_grouped_gemm=config.moe_grouped_gemm,
+        use_te_activation_func=False,  # use plain F.gelu(approximate='tanh') from config.activation_func
+    )
     return ModuleSpec(
-        module=Gemma4TransformerLayer,
-        submodules=Gemma4TransformerLayerSubmodules(
-            self_attention=ModuleSpec(
-                module=Gemma4SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
-                submodules=SelfAttentionSubmodules(
-                    linear_qkv=TELayerNormColumnParallelLinear,
-                    core_attention=TEDotProductAttention,
-                    linear_proj=TERowParallelLinear,
-                    q_layernorm=TENorm,
-                    k_layernorm=TENorm,
-                ),
-            ),
-            self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=IdentityOp,
-            mlp=ModuleSpec(
-                module=MLP,
-                submodules=MLPSubmodules(
-                    linear_fc1=TELayerNormColumnParallelLinear,
-                    linear_fc2=TERowParallelLinear,
-                ),
-            ),
-            mlp_bda=get_bias_dropout_add,
-            post_attention_layernorm=TENorm,
-            post_feedforward_layernorm=TENorm,
+        module=Gemma4MoELayer,
+        submodules=base_spec.submodules,
+        metainfo=base_spec.metainfo,
+    )
+
+
+def get_gemma4_layer_spec_te(config=None) -> ModuleSpec:
+    """Layer spec for Gemma4 using native Megatron attention with TE.
+
+    If ``config.enable_moe_block`` is set, the main ``mlp`` submodule is a
+    :class:`Gemma4MoELayer` (so that the state-dict path
+    ``.mlp.experts.linear_fc*.weight*`` matches mbridge's EP auto-handling),
+    and the original dense MLP moves to a sibling ``dense_mlp`` submodule that
+    the layer forward sums with the MoE output. For the 31B dense variant,
+    ``enable_moe_block=False`` and ``mlp`` stays as the normal Megatron MLP.
+    """
+    dense_mlp_spec = ModuleSpec(
+        module=MLP,
+        submodules=MLPSubmodules(
+            linear_fc1=TELayerNormColumnParallelLinear,
+            linear_fc2=TERowParallelLinear,
         ),
     )
+    if config is not None and getattr(config, "enable_moe_block", False):
+        mlp_spec = _build_moe_submodule_spec(config)
+        dense_spec = dense_mlp_spec
+    else:
+        mlp_spec = dense_mlp_spec
+        dense_spec = IdentityOp
+
+    submods = Gemma4TransformerLayerSubmodules(
+        self_attention=ModuleSpec(
+            module=Gemma4SelfAttention,
+            params={"attn_mask_type": AttnMaskType.causal},
+            submodules=SelfAttentionSubmodules(
+                linear_qkv=TELayerNormColumnParallelLinear,
+                core_attention=TEDotProductAttention,
+                linear_proj=TERowParallelLinear,
+                q_layernorm=TENorm,
+                k_layernorm=TENorm,
+            ),
+        ),
+        self_attn_bda=get_bias_dropout_add,
+        pre_mlp_layernorm=IdentityOp,
+        mlp=mlp_spec,
+        mlp_bda=get_bias_dropout_add,
+        post_attention_layernorm=TENorm,
+        post_feedforward_layernorm=TENorm,
+        dense_mlp=dense_spec,
+    )
+    return ModuleSpec(module=Gemma4TransformerLayer, submodules=submods)
 
 
 def _load_hf_text_config(hf_checkpoint):
@@ -686,8 +814,11 @@ def get_gemma4_spec(args, config, vp_stage):
     config.activation_func = _gelu_tanh
     config.bias_activation_fusion = False
 
-    # MoE: disable Megatron's built-in MoE (we use a custom Gemma4 MoE block in
-    # the layer body).
+    # MoE: our custom Gemma4MoELayer handles MoE inside the layer body. We
+    # set moe_layer_freq to all-zero so Megatron's built-in MoE dispatch (in
+    # the stock layer spec) doesn't fire — Gemma4TransformerLayer always uses
+    # the dense MLP slot for its dense feed-forward and calls the MoE block
+    # explicitly in its forward() when enable_moe_block is True.
     config.moe_layer_freq = [0] * config.num_layers
 
     # Heterogeneous layers (different head_dim / num_kv_heads on global vs
@@ -717,14 +848,30 @@ def get_gemma4_spec(args, config, vp_stage):
     # zeroed freqs and rotate the full head_dim unconditionally.
     config.apply_rope_fusion = False
 
-    # MoE block (26B-A4B)
+    # MoE block (26B-A4B). Gemma4MoELayer reads these fields and delegates
+    # to Megatron's MoE dispatch for expert parallelism (EP), so setting
+    # --expert-model-parallel-size > 1 actually shards expert weights.
     config.enable_moe_block = getattr(hf_text, "enable_moe_block", False)
     if config.enable_moe_block:
-        # These are consumed by Gemma4Router / Gemma4Experts; keep them aligned
-        # with HF's naming (num_experts, top_k_experts, moe_intermediate_size).
         config.num_moe_experts = hf_text.num_experts
         config.moe_router_topk = hf_text.top_k_experts
         config.moe_ffn_hidden_size = hf_text.moe_intermediate_size
+        # Megatron MoE infrastructure needs these fields set even though we
+        # use a custom router. Defaults mirror Qwen3.5-A3B's working config.
+        config.moe_token_dispatcher_type = getattr(config, "moe_token_dispatcher_type", None) or "alltoall"
+        config.moe_grouped_gemm = getattr(config, "moe_grouped_gemm", None) or True
+        # No aux loss: Gemma4's router doesn't use one. Megatron requires the
+        # field to be set; 0.0 disables it.
+        config.moe_aux_loss_coeff = 0.0
+        config.moe_router_load_balancing_type = getattr(config, "moe_router_load_balancing_type", None) or "none"
+        # Route scoring: Gemma4 does softmax itself in the router; tell
+        # Megatron to not re-compute anything — the only consumer of these
+        # fields on our path is TopKRouter, which we override with
+        # Gemma4Router. Set reasonable defaults so any internal validator
+        # passes.
+        config.moe_router_score_function = getattr(config, "moe_router_score_function", None) or "softmax"
+        config.moe_router_topk_scaling_factor = getattr(config, "moe_router_topk_scaling_factor", None) or 1.0
+        config.moe_router_pre_softmax = False
 
     # RoPE config
     rope_params = getattr(hf_text, "rope_parameters", {}) or {}
@@ -748,7 +895,9 @@ def get_gemma4_spec(args, config, vp_stage):
                 "max_tokens_per_gpu."
             )
 
-    spec = get_gemma4_layer_spec_te()
+    # Build layer spec AFTER setting MoE fields so the MoE submodule spec
+    # is attached when enable_moe_block is True.
+    spec = get_gemma4_layer_spec_te(config)
 
     # Use unfused layernorm + linear for MLP (matches HF numerics)
     from megatron.core.extensions.transformer_engine import TEColumnParallelLinear

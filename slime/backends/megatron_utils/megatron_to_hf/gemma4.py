@@ -77,15 +77,20 @@ def convert_gemma4_to_hf(args, name, param):
             return [(f"{L}.self_attn.q_norm.weight", param)]
         elif rest == "self_attention.k_layernorm.weight":
             return [(f"{L}.self_attn.k_norm.weight", param)]
-        elif rest == "mlp.linear_fc1.weight":
+        # Dense MLP paths. For the 31B dense variant this is the single `.mlp`
+        # submodule; for the 26B-A4B MoE variant Megatron's `.mlp` slot holds
+        # the MoE block and the parallel dense feed-forward lives at
+        # `.dense_mlp` (see Gemma4TransformerLayer). Both map to HF's
+        # `mlp.gate_proj/up_proj/down_proj` since HF calls it `mlp` regardless.
+        elif rest in ("mlp.linear_fc1.weight", "dense_mlp.linear_fc1.weight"):
             gate_weight, up_weight = param.chunk(2, dim=0)
             return [
                 (f"{L}.mlp.gate_proj.weight", gate_weight),
                 (f"{L}.mlp.up_proj.weight", up_weight),
             ]
-        elif rest == "mlp.linear_fc2.weight":
+        elif rest in ("mlp.linear_fc2.weight", "dense_mlp.linear_fc2.weight"):
             return [(f"{L}.mlp.down_proj.weight", param)]
-        elif rest == "mlp.linear_fc1.layer_norm_weight":
+        elif rest in ("mlp.linear_fc1.layer_norm_weight", "dense_mlp.linear_fc1.layer_norm_weight"):
             return [(f"{L}.pre_feedforward_layernorm.weight", param)]
         elif rest == "pre_mlp_layernorm.weight":
             return [(f"{L}.pre_feedforward_layernorm.weight", param)]
@@ -93,18 +98,32 @@ def convert_gemma4_to_hf(args, name, param):
             return [(f"{L}.post_attention_layernorm.weight", param)]
         elif rest == "post_feedforward_layernorm.weight":
             return [(f"{L}.post_feedforward_layernorm.weight", param)]
-        # MoE weights (26B-A4B)
-        elif rest == "router.proj.weight":
+        # MoE weights (26B-A4B). Under the MoE variant the MoE block is
+        # `self.mlp = Gemma4MoELayer`, so router lives at `.mlp.router.*` and
+        # per-expert TEGroupedLinear weights are at
+        # `.mlp.experts.linear_fc{1,2}.weight{E}` where E is the GLOBAL
+        # expert index (already remapped from local→global by callers).
+        elif rest == "mlp.router.proj.weight":
             return [(f"{L}.router.proj.weight", param)]
-        elif rest == "router.scale":
+        elif rest == "mlp.router.scale":
             return [(f"{L}.router.scale", param)]
-        elif rest == "router.per_expert_scale":
+        elif rest == "mlp.router.per_expert_scale":
             return [(f"{L}.router.per_expert_scale", param)]
-        elif rest == "experts.gate_up_proj":
-            return [(f"{L}.experts.gate_up_proj", param)]
-        elif rest == "experts.down_proj":
-            return [(f"{L}.experts.down_proj", param)]
-        elif rest == "pre_feedforward_layernorm_2.weight":
+        # Per-expert fused gate_up (2D, [2*I, H]) emitted as HF-indexed entry.
+        # sglang's gemma4 weight loader stacks per-expert 2D tensors into the
+        # global 3D `experts.gate_up_proj` during load.
+        else:
+            expert_match = re.match(r"mlp\.experts\.linear_fc([12])\.weight(\d+)", rest)
+            if expert_match:
+                fc, expert_idx = expert_match.group(1), int(expert_match.group(2))
+                if fc == "1":
+                    # param shape: [2*I, H] (gate stacked with up along dim 0)
+                    return [(f"{L}.experts.{expert_idx}.gate_up_proj.weight", param)]
+                else:
+                    # param shape: [H, I]
+                    return [(f"{L}.experts.{expert_idx}.down_proj.weight", param)]
+
+        if rest == "pre_feedforward_layernorm_2.weight":
             return [(f"{L}.pre_feedforward_layernorm_2.weight", param)]
         elif rest == "post_feedforward_layernorm_2.weight":
             return [(f"{L}.post_feedforward_layernorm_2.weight", param)]

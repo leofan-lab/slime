@@ -1,3 +1,6 @@
+import os
+import torch
+
 from .deepseekv3 import convert_deepseekv3_to_hf
 from .glm4 import convert_glm4_to_hf
 from .glm4moe import convert_glm4moe_to_hf
@@ -33,6 +36,47 @@ def convert_to_hf(args, model_name, name, param, quantization_config=None):
 _cached_tensors = {}
 
 
+_DUMP_INTERESTING = {
+    "model.language_model.layers.0.input_layernorm.weight",
+    "model.language_model.layers.0.self_attn.q_proj.weight",
+    "model.language_model.layers.0.self_attn.k_proj.weight",
+    "model.language_model.layers.0.self_attn.v_proj.weight",
+    "model.language_model.layers.0.self_attn.o_proj.weight",
+    "model.language_model.layers.0.mlp.gate_proj.weight",
+    "model.language_model.layers.0.mlp.up_proj.weight",
+    "model.language_model.layers.0.mlp.down_proj.weight",
+    "model.language_model.layers.0.router.proj.weight",
+    "model.language_model.layers.0.router.scale",
+    "model.language_model.layers.0.router.per_expert_scale",
+    "model.language_model.layers.0.experts.gate_up_proj",
+    "model.language_model.layers.0.experts.down_proj",
+    "model.language_model.embed_tokens.weight",
+    "model.language_model.norm.weight",
+}
+
+
+def _dump_emitted(path, named_tensors):
+    """Append stats for each (name, tensor) to `path` if the name is in
+    _DUMP_INTERESTING. Captures what convert_gemma4_to_hf actually emits at
+    runtime (post TP/EP gather), so we can verify parity against HF values."""
+    try:
+        for name, tensor in named_tensors:
+            if name not in _DUMP_INTERESTING:
+                continue
+            t = tensor.detach().float().cpu()
+            finite = torch.isfinite(t).all().item()
+            line = (
+                f"{name}\tshape={tuple(t.shape)}\tdtype={tensor.dtype}\t"
+                f"finite={finite}\tmean={t.mean().item():.6e}\t"
+                f"std={t.std().item():.6e}\tmin={t.min().item():.6e}\t"
+                f"max={t.max().item():.6e}\n"
+            )
+            with open(path, "a") as f:
+                f.write(line)
+    except Exception as e:
+        print(f"[GEMMA4_EMITTED_DUMP] failed: {type(e).__name__}: {e}")
+
+
 # TODO optimize code details
 def _convert_to_hf_core(args, model_name, name, param):
     if "glm4moelite" in model_name or "deepseekv3" in model_name:
@@ -55,6 +99,9 @@ def _convert_to_hf_core(args, model_name, name, param):
         converted_named_tensors = convert_qwen2_to_hf(args, name, param)
     elif "gemma" in model_name:
         converted_named_tensors = convert_gemma4_to_hf(args, name, param)
+        _dump_path = os.environ.get("GEMMA4_EMITTED_DUMP_PATH")
+        if _dump_path and converted_named_tensors:
+            _dump_emitted(_dump_path, converted_named_tensors)
     elif "llama" in model_name:
         converted_named_tensors = convert_llama_to_hf(args, name, param)
     elif "mimo" in model_name:

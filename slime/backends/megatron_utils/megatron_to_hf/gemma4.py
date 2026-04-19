@@ -67,16 +67,23 @@ def _log_emitted(emitted):
 
 def _check_finite(name, param):
     """Optional NaN/Inf sanity check. Enabled when GEMMA4_CONVERT_CHECK_FINITE=1.
-    Prints a loud warning on the first non-finite tensor."""
+    Prints a loud warning on the first non-finite tensor.
+
+    Uses a single reduction (all) and only forces a host-device sync when a
+    non-finite value actually exists, to avoid adding sync overhead to the
+    common case.
+    """
     if os.environ.get("GEMMA4_CONVERT_CHECK_FINITE") != "1":
         return
-    if param.dtype in (torch.bfloat16, torch.float16, torch.float32, torch.float64):
-        if not torch.isfinite(param).all():
-            import sys
-            n_nan = torch.isnan(param).sum().item()
-            n_inf = torch.isinf(param).sum().item()
-            print(f"[GEMMA4_NONFINITE] name={name} shape={tuple(param.shape)} dtype={param.dtype} nans={n_nan} infs={n_inf} min={param.min().item():.3e} max={param.max().item():.3e}",
-                  file=sys.stderr, flush=True)
+    if param.dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.float64):
+        return
+    finite = torch.isfinite(param).all()
+    if not finite.item():
+        import sys
+        n_nan = torch.isnan(param).sum().item()
+        n_inf = torch.isinf(param).sum().item()
+        print(f"[GEMMA4_NONFINITE] name={name} shape={tuple(param.shape)} dtype={param.dtype} nans={n_nan} infs={n_inf}",
+              file=sys.stderr, flush=True)
 
 
 def convert_gemma4_to_hf(args, name, param):

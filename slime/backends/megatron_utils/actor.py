@@ -108,9 +108,14 @@ class MegatronTrainRayActor(TrainRayActor):
                     if any(
                         marker in name for marker in (
                             "decoder.layers.0.self_attention.linear_qkv.layer_norm_weight",
+                            "decoder.layers.0.self_attention.linear_qkv.weight",
                             "decoder.layers.0.self_attention.linear_proj.weight",
                             "decoder.layers.0.dense_mlp.linear_fc2.weight",
+                            "decoder.layers.0.dense_mlp.linear_fc1.weight",
                             "decoder.layers.0.mlp.router.scale",
+                            "decoder.layers.0.mlp.router.proj.weight",
+                            "decoder.layers.0.mlp.experts.linear_fc1.weight0",
+                            "decoder.layers.0.mlp.experts.linear_fc2.weight0",
                         )
                     ):
                         sample[name] = p.detach().float().cpu().clone()

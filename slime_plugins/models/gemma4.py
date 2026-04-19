@@ -109,6 +109,12 @@ class Gemma4Router(nn.Module):
         top_k_weights = top_k_weights * self.per_expert_scale[top_k_index]
         return top_k_weights, top_k_index
 
+    def set_layer_number(self, layer_number):
+        # MoELayer.set_layer_number delegates to router.set_layer_number;
+        # Megatron's TopKRouter stores it for logging/aux-loss scoping. We
+        # don't use it, so accept and ignore.
+        self.layer_number = layer_number
+
 
 class Gemma4MoELayer(MoELayer):
     """Gemma4 MoE block: Megatron's MoELayer with Gemma4's custom router.

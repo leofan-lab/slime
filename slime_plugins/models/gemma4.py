@@ -130,6 +130,17 @@ class Gemma4MoELayer(MoELayer):
         # - token_dispatcher, experts (alltoall path, GroupedMLP)
         # Anything shared-expert related is disabled: Gemma4 has no shared experts in
         # this sense — its "dense MLP" lives outside the MoE block in the parent layer.
+        #
+        # Fall back to Megatron's global parallel_state when pg_collection isn't
+        # explicitly passed. TransformerLayer only forwards pg_collection when
+        # submodules.mlp.module is *exactly* one of
+        # (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP) — an identity check
+        # via `in`, so Gemma4MoELayer (a MoELayer subclass) slips through and
+        # receives None. BaseMoELayer.__init__ then crashes on `pg_collection.ep`.
+        # Same fallback MoELayer.__init__ uses when invoked directly.
+        if pg_collection is None:
+            from megatron.core.transformer.moe.moe_utils import get_default_pg_collection
+            pg_collection = get_default_pg_collection()
         BaseMoELayer.__init__(
             self, config=config, layer_number=layer_number, pg_collection=pg_collection
         )

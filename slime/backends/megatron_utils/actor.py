@@ -577,6 +577,15 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
 
+        # Diagnostic escape hatch: when GEMMA4_SKIP_UPDATE_WEIGHTS=1, skip the
+        # weight-transfer entirely. If subsequent rollouts produce finite output,
+        # the NaN is introduced by the update path (weight_loader / NCCL /
+        # cuda-graph re-replay), not by training or weight values themselves.
+        if os.environ.get("GEMMA4_SKIP_UPDATE_WEIGHTS") == "1":
+            if dist.is_initialized() and dist.get_rank() == 0:
+                logger.warning("GEMMA4_SKIP_UPDATE_WEIGHTS=1: skipping update_weights call")
+            return
+
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.recover_updatable_engines.remote())

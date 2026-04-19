@@ -191,7 +191,7 @@ def test_convert_gemma4_to_hf_moe_expert_weights_stacked():
     last = emitted_total[-1]
     assert len(last) == 1
     name, stacked = last[0]
-    assert name == "model.language_model.layers.3.experts.gate_up_proj.weight"
+    assert name == "model.language_model.layers.3.experts.gate_up_proj"
     assert stacked.shape == (num_experts, 2 * 704, 2816)
     for e, t in enumerate(fc1_tensors):
         assert torch.equal(stacked[e], t)
@@ -208,7 +208,7 @@ def test_convert_gemma4_to_hf_moe_expert_weights_stacked():
     last = emitted_total[-1]
     assert len(last) == 1
     name, stacked = last[0]
-    assert name == "model.language_model.layers.3.experts.down_proj.weight"
+    assert name == "model.language_model.layers.3.experts.down_proj"
     assert stacked.shape == (num_experts, 2816, 704)
     for e, t in enumerate(fc2_tensors):
         assert torch.equal(stacked[e], t)

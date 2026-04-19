@@ -168,7 +168,9 @@ def _buffer_expert_and_maybe_flush(layer_idx, fc, expert_idx, param, L_prefix, n
 
     if fc == "1":
         # Per-expert linear_fc1 comes in as [2*I, H]; stacked is [E, 2I, H].
-        return [(f"{L_prefix}.experts.gate_up_proj.weight", stacked)]
+        # HF stores these WITHOUT a `.weight` suffix; sglang's gemma4 loader
+        # relies on exact-name lookup after `experts.gate_up_proj → experts.w13_weight`.
+        return [(f"{L_prefix}.experts.gate_up_proj", stacked)]
     else:
         # Per-expert linear_fc2 comes in as [H, I]; stacked is [E, H, I].
-        return [(f"{L_prefix}.experts.down_proj.weight", stacked)]
+        return [(f"{L_prefix}.experts.down_proj", stacked)]

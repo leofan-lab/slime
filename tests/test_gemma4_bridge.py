@@ -160,43 +160,58 @@ def test_mlp_gate_up_roundtrip():
     assert torch.equal(gate, gate2) and torch.equal(up, up2)
 
 
-def test_convert_gemma4_to_hf_moe_expert_weights():
-    """Per-expert fc1/fc2 weights (from TEGroupedLinear) map to HF-indexed entries.
-
-    Under the new MoELayer-based architecture, each local expert emits
-    parameters like `mlp.experts.linear_fc1.weight5` (where 5 is the GLOBAL
-    expert index after local→global remap). They should convert to HF-style
-    per-expert keys that sglang can consume.
+def test_convert_gemma4_to_hf_moe_expert_weights_stacked():
+    """Per-expert fc1/fc2 weights (from TEGroupedLinear) stream in one at a time
+    and the converter buffers them until all experts arrive, then emits a single
+    stacked 3D tensor matching sglang's Gemma4 loader expectation.
     """
     conv = _load_convert_module()
+    num_experts = 4  # keep test fast
     conv._config_cache["config"] = {
         "global_attn_layers": {5},
         "local_head_dim": 256, "global_head_dim": 512,
         "num_attention_heads": 16,
         "local_num_kv_heads": 8, "global_num_kv_heads": 2,
         "hidden_size": 2816,
+        "num_experts": num_experts,
     }
+    conv._expert_buffers.clear()
     args = SimpleNamespace(hf_checkpoint="/nonexistent")
 
-    # linear_fc1.weight{E}: [2*I, H] (gate stacked with up)
-    param_fc1 = torch.randn(2 * 704, 2816)
-    emitted = conv.convert_gemma4_to_hf(
-        args, "module.module.decoder.layers.3.mlp.experts.linear_fc1.weight7", param_fc1,
-    )
-    assert len(emitted) == 1
-    name, tensor = emitted[0]
-    assert name == "model.language_model.layers.3.experts.7.gate_up_proj.weight"
-    assert tensor.shape == (2 * 704, 2816)
+    # Stream all 4 experts' linear_fc1 tensors. Only the last should emit.
+    fc1_tensors = [torch.randn(2 * 704, 2816) for _ in range(num_experts)]
+    emitted_total = []
+    for e, t in enumerate(fc1_tensors):
+        out = conv.convert_gemma4_to_hf(
+            args, f"module.module.decoder.layers.3.mlp.experts.linear_fc1.weight{e}", t,
+        )
+        emitted_total.append(out)
+    # Only the last flush produces output.
+    assert all(len(out) == 0 for out in emitted_total[:-1])
+    last = emitted_total[-1]
+    assert len(last) == 1
+    name, stacked = last[0]
+    assert name == "model.language_model.layers.3.experts.gate_up_proj.weight"
+    assert stacked.shape == (num_experts, 2 * 704, 2816)
+    for e, t in enumerate(fc1_tensors):
+        assert torch.equal(stacked[e], t)
 
-    # linear_fc2.weight{E}: [H, I]
-    param_fc2 = torch.randn(2816, 704)
-    emitted = conv.convert_gemma4_to_hf(
-        args, "module.module.decoder.layers.3.mlp.experts.linear_fc2.weight7", param_fc2,
-    )
-    assert len(emitted) == 1
-    name, tensor = emitted[0]
-    assert name == "model.language_model.layers.3.experts.7.down_proj.weight"
-    assert tensor.shape == (2816, 704)
+    # Same for linear_fc2.
+    fc2_tensors = [torch.randn(2816, 704) for _ in range(num_experts)]
+    emitted_total = []
+    for e, t in enumerate(fc2_tensors):
+        out = conv.convert_gemma4_to_hf(
+            args, f"module.module.decoder.layers.3.mlp.experts.linear_fc2.weight{e}", t,
+        )
+        emitted_total.append(out)
+    assert all(len(out) == 0 for out in emitted_total[:-1])
+    last = emitted_total[-1]
+    assert len(last) == 1
+    name, stacked = last[0]
+    assert name == "model.language_model.layers.3.experts.down_proj.weight"
+    assert stacked.shape == (num_experts, 2816, 704)
+    for e, t in enumerate(fc2_tensors):
+        assert torch.equal(stacked[e], t)
 
 
 def test_convert_gemma4_to_hf_moe_router_weights():

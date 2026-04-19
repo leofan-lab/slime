@@ -4,6 +4,18 @@ import torch
 
 _config_cache = {}
 
+# Per-layer buffers for stacked expert tensors. sglang's Gemma4 loader expects
+# `experts.gate_up_proj` as a single 3D tensor of shape [E, 2I, H] and
+# `experts.down_proj` as [E, H, I] — it walks all experts inside the loader
+# and would silently drop per-expert 2D inputs. We accumulate expert tensors
+# as they stream through and emit the stacked form once all num_experts arrive.
+_expert_buffers: dict = {}
+
+
+def _get_num_experts(args):
+    cfg = _get_config(args)
+    return cfg.get("num_experts")
+
 
 def _get_config(args):
     if "config" not in _config_cache:
@@ -18,6 +30,7 @@ def _get_config(args):
             "local_num_kv_heads": hf_text.num_key_value_heads,
             "global_num_kv_heads": hf_text.num_global_key_value_heads,
             "hidden_size": hf_text.hidden_size,
+            "num_experts": getattr(hf_text, "num_experts", 0),
         }
     return _config_cache["config"]
 
@@ -109,19 +122,20 @@ def convert_gemma4_to_hf(args, name, param):
             return [(f"{L}.router.scale", param)]
         elif rest == "mlp.router.per_expert_scale":
             return [(f"{L}.router.per_expert_scale", param)]
-        # Per-expert fused gate_up (2D, [2*I, H]) emitted as HF-indexed entry.
-        # sglang's gemma4 weight loader stacks per-expert 2D tensors into the
-        # global 3D `experts.gate_up_proj` during load.
+        # Per-expert weights → buffer and emit stacked 3D tensors once all experts
+        # in the layer have arrived. sglang's Gemma4 loader expects
+        #   `experts.gate_up_proj`  shape [E, 2I, H]
+        #   `experts.down_proj`     shape [E, H, I]
+        # as single 3D tensors (unlike qwen3_moe which takes per-expert 2D).
+        # Rather than patching sglang, we match sglang's expectation here.
         else:
             expert_match = re.match(r"mlp\.experts\.linear_fc([12])\.weight(\d+)", rest)
             if expert_match:
                 fc, expert_idx = expert_match.group(1), int(expert_match.group(2))
-                if fc == "1":
-                    # param shape: [2*I, H] (gate stacked with up along dim 0)
-                    return [(f"{L}.experts.{expert_idx}.gate_up_proj.weight", param)]
-                else:
-                    # param shape: [H, I]
-                    return [(f"{L}.experts.{expert_idx}.down_proj.weight", param)]
+                return _buffer_expert_and_maybe_flush(
+                    layer_idx, fc, expert_idx, param, L,
+                    num_experts=cfg["num_experts"],
+                )
 
         if rest == "pre_feedforward_layernorm_2.weight":
             return [(f"{L}.pre_feedforward_layernorm_2.weight", param)]
@@ -131,3 +145,30 @@ def convert_gemma4_to_hf(args, name, param):
             return [(f"{L}.post_feedforward_layernorm_1.weight", param)]
 
     raise ValueError(f"Unknown Gemma4 parameter name: {name}")
+
+
+def _buffer_expert_and_maybe_flush(layer_idx, fc, expert_idx, param, L_prefix, num_experts):
+    """Buffer per-expert tensor; emit stacked 3D `experts.gate_up_proj` / `experts.down_proj`
+    once the bucket for (layer, fc) has all `num_experts` experts."""
+    assert num_experts and num_experts > 0, (
+        f"num_experts must be known for MoE layer expert conversion, got {num_experts}"
+    )
+    key = (layer_idx, fc)
+    bucket = _expert_buffers.setdefault(key, {})
+    # Deliberately allow re-entry (EP all-gather may re-stream): overwrite.
+    bucket[expert_idx] = param
+
+    if len(bucket) < num_experts:
+        return []
+
+    # Stack in expert-index order.
+    ordered = [bucket[i] for i in range(num_experts)]
+    stacked = torch.stack(ordered, dim=0).contiguous()
+    del _expert_buffers[key]
+
+    if fc == "1":
+        # Per-expert linear_fc1 comes in as [2*I, H]; stacked is [E, 2I, H].
+        return [(f"{L_prefix}.experts.gate_up_proj.weight", stacked)]
+    else:
+        # Per-expert linear_fc2 comes in as [H, I]; stacked is [E, H, I].
+        return [(f"{L_prefix}.experts.down_proj.weight", stacked)]

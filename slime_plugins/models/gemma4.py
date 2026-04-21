@@ -197,8 +197,23 @@ class Gemma4MoELayer(MoELayer):
         from megatron.core.transformer.moe.moe_utils import MoECudaGraphTensorStore
         self.cudagraph_tensor_store = MoECudaGraphTensorStore()
 
+        # pre_feedforward_layernorm_2: applied to experts' input ONLY (router
+        # input stays un-normed). Matches HF Gemma4TextDecoderLayer:
+        #   hidden_states_flat = residual            # router input (un-normed)
+        #   hidden_states_2 = pre_feedforward_layernorm_2(hidden_states_flat)
+        #   hidden_states_2 = experts(hidden_states_2, top_k_index, top_k_weights)
+        self.pre_feedforward_layernorm_2 = TENorm(
+            config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon,
+        )
+
     def route(self, hidden_states: torch.Tensor):
         """Call Gemma4Router and pack its output into Megatron's (probs, routing_map).
+
+        HF semantic: router sees the UN-NORMED residual, not the pre-norm-2'd
+        input that's about to go to the experts. When our forward() stashes the
+        original (un-normed) residual in `self._router_input`, use it here;
+        otherwise fall back to the dispatcher's `hidden_states` (happens when
+        this method is invoked directly, e.g. in tests).
 
         Gemma4Router expects a flattened [T, H] tensor and returns compact top-k:
             top_k_weights: [T, K] — routing weights (already scaled by per_expert_scale)
@@ -207,8 +222,11 @@ class Gemma4MoELayer(MoELayer):
             probs:       [T, E] — weight per (token, expert), 0 where not routed
             routing_map: [T, E] — boolean mask
         """
-        orig_shape = hidden_states.shape
-        flat = hidden_states.view(-1, orig_shape[-1])
+        router_input = getattr(self, "_router_input", None)
+        if router_input is None:
+            router_input = hidden_states
+        orig_shape = router_input.shape
+        flat = router_input.reshape(-1, orig_shape[-1])
         top_k_weights, top_k_index = self.router(flat)
 
         num_tokens = flat.shape[0]
@@ -221,10 +239,26 @@ class Gemma4MoELayer(MoELayer):
         routing_map = probs != 0
         return probs, routing_map
 
-    # BaseMoELayer.forward is abstract; MoELayer defines a concrete forward
-    # that we inherit. It calls self.route → self.preprocess → self.dispatch →
-    # self.routed_experts_compute → self.combine. All of those work with
-    # Megatron's (probs, routing_map) format that our route() now produces.
+    def forward(self, hidden_states: torch.Tensor):
+        """Gemma4 MoE forward: router sees un-normed residual, experts see
+        `pre_feedforward_layernorm_2(residual)`. This matches HF's
+        Gemma4TextDecoderLayer.forward (modeling_gemma4.py):
+            hidden_states_flat = residual                # un-normed
+            _, tk_w, tk_i = self.router(hidden_states_flat)
+            hidden_states_2 = self.pre_feedforward_layernorm_2(hidden_states_flat)
+            hidden_states_2 = self.experts(hidden_states_2, tk_i, tk_w)
+
+        We stash the un-normed residual before calling super().forward on the
+        normed tensor (which will drive dispatch and experts). Our overridden
+        route() reaches back to the stashed un-normed tensor for routing.
+        """
+        self._router_input = hidden_states
+        try:
+            normed = self.pre_feedforward_layernorm_2(hidden_states)
+            output, mlp_bias = super().forward(normed)
+        finally:
+            self._router_input = None
+        return output, mlp_bias
 
 
 class Gemma4TransformerLayer(TransformerLayer):
@@ -313,9 +347,11 @@ class Gemma4TransformerLayer(TransformerLayer):
             self.post_feedforward_layernorm_1 = TENorm(
                 config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon,
             )
-            self.pre_feedforward_layernorm_2 = TENorm(
-                config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon,
-            )
+            # pre_feedforward_layernorm_2 now lives INSIDE Gemma4MoELayer
+            # (matching HF Gemma4TextDecoderLayer semantics: router sees un-normed
+            # residual, experts see pre_feedforward_layernorm_2(residual)). This
+            # attribute is kept on the MoE block so mbridge/state-dict paths
+            # don't change.
             self.post_feedforward_layernorm_2 = TENorm(
                 config=config, hidden_size=config.hidden_size, eps=config.layernorm_epsilon,
             )
@@ -408,9 +444,13 @@ class Gemma4TransformerLayer(TransformerLayer):
                 dense_out = dense_out + dense_bias
             mlp_output = self.post_feedforward_layernorm_1(dense_out)
 
-            # MoE input uses a dedicated pre-norm (HF's `pre_feedforward_layernorm_2`).
-            moe_input = self.pre_feedforward_layernorm_2(residual)
-            moe_output, _ = self.mlp(moe_input)  # Gemma4MoELayer returns (output, mlp_bias=None)
+            # MoE: HF reference (modeling_gemma4.py Gemma4TextDecoderLayer.forward)
+            # passes UN-NORMED residual to the router; experts get
+            # `pre_feedforward_layernorm_2(residual)`. We pass residual (un-normed)
+            # to self.mlp (Gemma4MoELayer); Gemma4MoELayer internally applies
+            # pre_feedforward_layernorm_2 before the experts but keeps the router
+            # input un-normed (matching HF).
+            moe_output, _ = self.mlp(residual)
             moe_output = self.post_feedforward_layernorm_2(moe_output)
 
             hidden_states = mlp_output + moe_output
@@ -750,10 +790,16 @@ def get_gemma4_layer_spec_te(config=None) -> ModuleSpec:
     the layer forward sums with the MoE output. For the 31B dense variant,
     ``enable_moe_block=False`` and ``mlp`` stays as the normal Megatron MLP.
     """
+    # dense_mlp: use a plain (non-fused-layernorm) linear_fc1 so our explicit
+    # `pre_mlp_layernorm` in the layer forward is the sole norm applied to the
+    # MLP input. Using TELayerNormColumnParallelLinear here would apply a
+    # SECOND layernorm inside fc1, resulting in double-normalization and
+    # ~8× inflated MLP outputs (detected by test_a2_stage_diff.py on 2026-04-20).
+    from megatron.core.extensions.transformer_engine import TEColumnParallelLinear
     dense_mlp_spec = ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear,
+            linear_fc1=TEColumnParallelLinear,
             linear_fc2=TERowParallelLinear,
         ),
     )

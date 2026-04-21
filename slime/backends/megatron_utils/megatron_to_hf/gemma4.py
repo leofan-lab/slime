@@ -190,6 +190,13 @@ def convert_gemma4_to_hf(args, name, param):
                 )
 
         if rest == "pre_feedforward_layernorm_2.weight":
+            # Legacy: pre_feedforward_layernorm_2 used to live on the layer.
+            return [(f"{L}.pre_feedforward_layernorm_2.weight", param)]
+        elif rest == "mlp.pre_feedforward_layernorm_2.weight":
+            # Current: pre_feedforward_layernorm_2 is owned by Gemma4MoELayer so
+            # the Megatron state-dict path is `.mlp.pre_feedforward_layernorm_2.
+            # weight`. HF still expects it at the decoder-layer level (sglang's
+            # Gemma4DecoderLayer also keeps it there), so emit without the `mlp.`.
             return [(f"{L}.pre_feedforward_layernorm_2.weight", param)]
         elif rest == "post_feedforward_layernorm_2.weight":
             return [(f"{L}.post_feedforward_layernorm_2.weight", param)]

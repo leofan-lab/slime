@@ -81,6 +81,14 @@ class Gemma4Bridge(Gemma3Bridge):
         "decoder.layers.{layer_number}.mlp.router.per_expert_scale": [
             "model.language_model.layers.{layer_number}.router.per_expert_scale",
         ],
+        # pre_feedforward_layernorm_2 now owned by Gemma4MoELayer so the Megatron
+        # path is `.mlp.pre_feedforward_layernorm_2.weight`. HF still expects it
+        # at the decoder-layer level. See slime_plugins/models/gemma4.py — this
+        # ownership change aligns slime's router semantic with HF (router sees
+        # un-normed residual, experts see pre_ff_norm_2(residual)).
+        "decoder.layers.{layer_number}.mlp.pre_feedforward_layernorm_2.weight": [
+            "model.language_model.layers.{layer_number}.pre_feedforward_layernorm_2.weight",
+        ],
     }
 
     _OTHER_MAPPING = {
@@ -94,11 +102,9 @@ class Gemma4Bridge(Gemma3Bridge):
             "model.language_model.layers.{layer_number}.layer_scalar",
         ],
         # MoE variant extra layernorms that wrap the dense + MoE paths before
-        # summing. These live on the transformer layer directly (not under
-        # `.mlp` or `.dense_mlp`).
-        "decoder.layers.{layer_number}.pre_feedforward_layernorm_2.weight": [
-            "model.language_model.layers.{layer_number}.pre_feedforward_layernorm_2.weight",
-        ],
+        # summing. `pre_feedforward_layernorm_2` moved to
+        # `.mlp.pre_feedforward_layernorm_2.weight` (see `_MLP_MAPPING` above);
+        # `post_feedforward_layernorm_1/_2` still live on the layer directly.
         "decoder.layers.{layer_number}.post_feedforward_layernorm_2.weight": [
             "model.language_model.layers.{layer_number}.post_feedforward_layernorm_2.weight",
         ],
@@ -151,6 +157,31 @@ class Gemma4Bridge(Gemma3Bridge):
                 ]
 
         return [x.format(layer_number=layer_number) for x in self._ATTENTION_MAPPING[key]]
+
+    def _weight_name_mapping_mcore_local_to_global(
+        self, model, consider_ep: bool = True
+    ):
+        """Restore the GPT-style local→global mapping for text-only Gemma4.
+
+        Gemma3Bridge (our base class) assumes a VLM structure where
+        ``model.language_model.decoder.layers`` exists, and only applies the
+        PP layer-offset remap when that attribute is present. Our Gemma4
+        model provider builds a plain ``GPTModel`` (text-only) with
+        ``model.decoder.layers``, so the Gemma3 check fails silently and all
+        PP ranks end up mapping their local layer index i → global index i —
+        which means every PP rank loads HF layers ``0..N/PP-1`` into its
+        local slots. The result is that, post-conversion, the torch_dist
+        checkpoint has layer weights cyclically duplicated with period
+        (num_layers / pp_size).
+
+        We override to delegate to ``Bridge._weight_name_mapping_mcore_local_to_global``
+        from the top-level mbridge base class, which walks ``model.decoder.layers``
+        directly — matching our GPT-style layout.
+        """
+        from mbridge.core.bridge import Bridge
+        return Bridge._weight_name_mapping_mcore_local_to_global(
+            self, model, consider_ep=consider_ep
+        )
 
     def _weight_name_mapping_mlp(self, name: str) -> list[str]:
         # Per-expert MoE weight: Megatron names the per-expert tensors

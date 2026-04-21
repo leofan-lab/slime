@@ -317,6 +317,8 @@ def update_weights_from_distributed(
     """
     Send metadata (Ray), broadcast tensors (NCCL rank 0 → engines).
     """
+    import os as _os
+    _flush = _os.environ.get("SLIME_FLUSH_CACHE_POST_UPDATE") == "1"
     refs = [
         engine.update_weights_from_distributed.remote(
             names=[name for name, _ in converted_named_tensors],
@@ -324,6 +326,7 @@ def update_weights_from_distributed(
             shapes=[param.shape for _, param in converted_named_tensors],
             group_name=group_name,
             weight_version=str(weight_version),
+            flush_cache=_flush,
         )
         for engine in rollout_engines
     ]
